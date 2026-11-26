@@ -1,0 +1,45 @@
+.venv/
+.vllm/
+__pycache__/
+*.py[cod]
+data/
+frontend/node_modules/
+frontend/dist/
+models/
+
+# Local media and subtitles
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.wav
+*.mp3
+*.srt
+*.vtt
+
+# Logs and model files
+logs/
+*.log
+*.log.*
+slurm-*.out
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.gguf
+*.bin
+
+# Local credentials
+.env
+.env.*
+.netrc
+.git-credentials
+secrets/
+credentials*.json
+api_key*
+*.key
+*.pem
+*.p12
+*.pfx
