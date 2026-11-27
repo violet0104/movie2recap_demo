@@ -4,6 +4,7 @@
 import os
 import re
 import json
+import time
 import argparse
 import httpx
 
@@ -51,12 +52,17 @@ Return JSON only, without explanations, Markdown, or any additional text:
 The number of scores must exactly match the number of input caption_events.
 """
 
+DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEFAULT_MODEL = "deepseek-flash"
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+
 # extract captions
 def extract_captions(record):
     if "segments" in record:
         return record["segments"]
     fps = float(record.get("target_fps", 1.0))
-    source = record.get("output")
+    source = record.get("output") or {}
 
     captions = []
     previous_end = 0.0
@@ -76,38 +82,95 @@ def extract_captions(record):
             previous_end = end
     return captions
 
+
+def _strip_code_fence(text):
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _parse_scores(content, expected_count):
+    if not content or not content.strip():
+        raise ValueError("Model returned an empty response")
+    parsed = json.loads(_strip_code_fence(content))
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("scores"), list):
+        raise ValueError("Model response JSON must contain a 'scores' list")
+    scores = parsed["scores"]
+    if len(scores) != expected_count:
+        raise ValueError(f"Expected {expected_count} scores, but got {len(scores)}")
+    return [round(max(0.0, min(1.0, float(item))), 2) for item in scores]
+
+
+def _thinking_enabled():
+    return os.environ.get("DEEPSEEK_THINKING", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
 # use Deepseek scoring captions
-def score(captions):
+def score(captions, *, max_retries=None, backoff=1.0):
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError("请为任务进程设置 DEEPSEEK_API_KEY")
-    response = httpx.post(
-        "https://api.deepseek.com/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": "deepseek-flash",
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(captions, ensure_ascii=False)},
-            ],
-            "stream": False,
-            "reasoning_effort": "high",
-            "response_format": {"type": "json_object"},
-            "thinking": {"type": "enabled"},
-        },
-        timeout=900,
+    base_url = os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    model = os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    attempts = (
+        max(1, int(os.environ.get("DEEPSEEK_MAX_RETRIES", "3")))
+        if max_retries is None
+        else max(1, max_retries)
     )
-    response.raise_for_status()
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(captions, ensure_ascii=False)},
+        ],
+        "stream": False,
+        "response_format": {"type": "json_object"},
+    }
+    if _thinking_enabled():
+        payload["thinking"] = {"type": "enabled"}
+        effort = os.environ.get("DEEPSEEK_REASONING_EFFORT", "high").strip()
+        if effort:
+            payload["reasoning_effort"] = effort
 
-    content = response.json()["choices"][0]["message"]["content"]
-    if not content:
-        raise RuntimeError("Model returned an empty response")
-    scores = json.loads(content.strip())["scores"]
+    last_error = None
+    scores = None
+    for attempt in range(attempts):
+        try:
+            response = httpx.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload,
+                timeout=900,
+            )
+        except httpx.HTTPError as error:
+            last_error = RuntimeError(f"DeepSeek 请求失败: {error}")
+            if attempt + 1 < attempts:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            raise last_error from error
 
-    if len(scores) != len(captions):
-        raise ValueError(
-            f"Expected {len(captions)} scores, but got {len(scores)}"
-        )
+        if response.is_error:
+            last_error = RuntimeError(f"DeepSeek HTTP {response.status_code}: {response.text[:1000]}")
+            if response.status_code in RETRYABLE_STATUS and attempt + 1 < attempts:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            raise last_error
+
+        try:
+            content = response.json()["choices"][0]["message"]["content"]
+            scores = _parse_scores(content, len(captions))
+            break
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
+            last_error = RuntimeError(f"DeepSeek 返回评分解析失败: {error}")
+            if attempt + 1 < attempts:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            raise last_error from error
+
+    if scores is None:
+        raise last_error
 
     return [
         {
@@ -115,9 +178,9 @@ def score(captions):
             "start": caption["start"],
             "end": caption["end"],
             "caption": caption["caption"],
-            "score": round(float(score), 2),
+            "score": score_value,
         }
-        for caption, score in zip(captions, scores)
+        for caption, score_value in zip(captions, scores)
     ]
 
 

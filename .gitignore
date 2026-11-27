@@ -2,6 +2,7 @@
 .vllm/
 __pycache__/
 *.py[cod]
+.pytest_cache/
 data/
 frontend/node_modules/
 frontend/dist/

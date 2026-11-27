@@ -1,3 +1,6 @@
+import os
+import shutil
+import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
@@ -8,15 +11,26 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import model
 from .media import preview_clip, read_subtitles
-from .store import DIST, PROJECTS, enqueue, lock, movie_path, read_json, version_path, write_json
+from .store import DIST, PROJECTS, enqueue, lock, movie_path, read_json, version_path, worker_alive, write_json
 
 app = FastAPI(title="Movie to Recap")
 CHUNK_SIZE = 8 * 1024 * 1024
+MAX_SUBTITLE_SIZE = 16 * 1024 * 1024
+_clip_locks_guard = threading.Lock()
+_clip_locks: dict[str, threading.Lock] = {}
+
+
+def _clip_lock(key: str) -> threading.Lock:
+    with _clip_locks_guard:
+        mutex = _clip_locks.get(key)
+        if mutex is None:
+            mutex = _clip_locks[key] = threading.Lock()
+        return mutex
 
 
 class Generate(BaseModel):
-    target_minutes: int = Field(default=15, ge=10, le=20)
     subtitle_offset: float = Field(default=0, allow_inf_nan=False)
 
 
@@ -146,7 +160,12 @@ def save_subtitles(project, name, content):
 async def put_subtitles(project_id: UUID, name: str, request: Request):
     if Path(name).suffix.lower() != ".srt":
         raise HTTPException(422, "字幕须为 SRT")
-    return await run_in_threadpool(save_subtitles, project_path(project_id), name, await request.body())
+    content = bytearray()
+    async for data in request.stream():
+        content.extend(data)
+        if len(content) > MAX_SUBTITLE_SIZE:
+            raise HTTPException(413, "字幕文件大小不能超过 16 MiB")
+    return await run_in_threadpool(save_subtitles, project_path(project_id), name, bytes(content))
 
 
 @app.post("/api/projects/{project_id}/generate", status_code=202)
@@ -240,13 +259,38 @@ def get_clip_preview(project_id: UUID, clip_id: str, start: float | None = None,
         raise HTTPException(422, "原片入点或出点无效")
     directory = project / "exports" / "clips"
     directory.mkdir(exist_ok=True)
-    path = directory / f"{clip_id}-{start}-{end}.mp4"
+    path = directory / f"{clip_id}-{start:.3f}-{end:.3f}.mp4"
     if not path.is_file():
-        with TemporaryDirectory(dir=directory) as scratch:
-            temp = Path(scratch) / "clip.mp4"
-            preview_clip(movie_path(project, job["movie"]), start, end, temp)
-            temp.replace(path)
+        with _clip_lock(str(path)):
+            if not path.is_file():
+                with TemporaryDirectory(dir=directory) as scratch:
+                    temp = Path(scratch) / "clip.mp4"
+                    preview_clip(movie_path(project, job["movie"]), start, end, temp)
+                    temp.replace(path)
     return FileResponse(path, media_type="video/mp4")
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: UUID):
+    project = project_path(project_id)
+    with lock(project / ".lock"):
+        editable_job(project)
+        shutil.rmtree(project)
+    return {"id": project_id.hex, "deleted": True}
+
+
+@app.get("/api/health")
+def health():
+    vllm = model.check_model_server(timeout=2.0)
+    worker_running = worker_alive()
+    deepseek_configured = bool(os.environ.get("DEEPSEEK_API_KEY"))
+    ok = worker_running and vllm["ok"] and deepseek_configured
+    return {
+        "status": "ok" if ok else "degraded",
+        "worker_running": worker_running,
+        "vllm": vllm,
+        "deepseek_key_configured": deepseek_configured,
+    }
 
 
 @app.get("/api/projects/{project_id}/media/{asset_id}")

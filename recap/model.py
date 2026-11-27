@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import time
 from math import ceil
 
 import httpx
@@ -8,6 +9,8 @@ from pydantic import BaseModel, Field
 
 MODEL = os.environ.get("RECAP_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
 MODEL_URL = os.environ.get("RECAP_MODEL_URL", "http://127.0.0.1:8001/v1").rstrip("/")
+MODEL_MAX_RETRIES = max(1, int(os.environ.get("RECAP_MODEL_MAX_RETRIES", "3")))
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
 
 class Range(BaseModel):
@@ -23,16 +26,6 @@ class CaptionBatch(BaseModel):
     segments: list[Caption]
 
 
-class Beat(BaseModel):
-    description: str = Field(max_length=400)
-    event_ids: list[str] = Field(min_length=1, max_length=5)
-
-
-class Chapter(BaseModel):
-    synopsis: str = Field(max_length=800)
-    beats: list[Beat] = Field(max_length=2)
-
-
 class Candidate(Range):
     event_id: str
 
@@ -44,17 +37,6 @@ class ScriptLine(BaseModel):
 
 class Script(BaseModel):
     segments: list[ScriptLine] = Field(min_length=1)
-
-
-class DraftLine(ScriptLine):
-    beat: int = Field(ge=1, le=4)
-    text: str = Field(max_length=360)
-    candidates: list[Candidate] = Field(min_length=1, max_length=3)
-    use_all_candidates: bool = False
-
-
-class Draft(Script):
-    segments: list[DraftLine] = Field(min_length=1, max_length=12)
 
 
 class Narration(BaseModel):
@@ -69,7 +51,18 @@ class ModelOutputTooLong(RuntimeError):
     pass
 
 
-def ask(schema, prompt, data, *, frames=None, duration=None, max_tokens=4096):
+def check_model_server(timeout: float = 5.0) -> dict:
+    try:
+        response = httpx.get(f"{MODEL_URL}/models", timeout=timeout, trust_env=False)
+        if response.is_error:
+            return {"ok": False, "url": MODEL_URL, "error": f"HTTP {response.status_code}"}
+        models = [item.get("id") for item in response.json().get("data", []) if isinstance(item, dict)]
+        return {"ok": True, "url": MODEL_URL, "models": models, "target_present": not models or MODEL in models}
+    except (httpx.HTTPError, ValueError) as error:
+        return {"ok": False, "url": MODEL_URL, "error": str(error)}
+
+
+def ask(schema, prompt, data, *, frames=None, duration=None, max_tokens=4096, max_retries=None, backoff=1.0):
     content = [{"type": "text", "text": f"{prompt}\n\n{json.dumps(data, ensure_ascii=False)}"}]
     payload = {
         "model": MODEL,
@@ -89,13 +82,28 @@ def ask(schema, prompt, data, *, frames=None, duration=None, max_tokens=4096):
             "frames_indices": [index for index, _ in frames], "duration": duration,
             "total_num_frames": ceil(duration), "do_sample_frames": False,
         }}
-    response = httpx.post(f"{MODEL_URL}/chat/completions", json=payload, timeout=900, trust_env=False)
-    if response.is_error:
-        raise RuntimeError(f"模型服务 HTTP {response.status_code}: {response.text[:1000]}")
-    choice = response.json()["choices"][0]
-    if choice["finish_reason"] == "length":
-        raise ModelOutputTooLong(f"模型输出超过长度限制（{schema.__name__}，{max_tokens} tokens）")
-    return schema.model_validate_json(choice["message"]["content"])
+    attempts = MODEL_MAX_RETRIES if max_retries is None else max(1, max_retries)
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            response = httpx.post(f"{MODEL_URL}/chat/completions", json=payload, timeout=900, trust_env=False)
+        except httpx.HTTPError as error:
+            last_error = RuntimeError(f"模型服务连接失败: {error}")
+            if attempt + 1 < attempts:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            raise last_error from error
+        if response.is_error:
+            last_error = RuntimeError(f"模型服务 HTTP {response.status_code}: {response.text[:1000]}")
+            if response.status_code in RETRYABLE_STATUS and attempt + 1 < attempts:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            raise last_error
+        choice = response.json()["choices"][0]
+        if choice["finish_reason"] == "length":
+            raise ModelOutputTooLong(f"模型输出超过长度限制（{schema.__name__}，{max_tokens} tokens）")
+        return schema.model_validate_json(choice["message"]["content"])
+    raise last_error
 
 
 def caption_batch(frames, duration, start, end, dialogue):
@@ -114,22 +122,6 @@ def caption_batch(frames, duration, start, end, dialogue):
     }, frames=frames, duration=duration, max_tokens=8192).segments
 
 
-def outline(events, dialogue, earlier, final):
-    return ask(Chapter, (
-        "Plan this part of a chapter for a faithful movie recap. Read the timed dialogue "
-        "through the end of this range before choosing what matters. Use only events from "
-        "this time range as evidence. Summarize what changes and select up to two turning points in "
-        "the order the film presents them. Keep flashbacks and revelations where they appear. "
-        "For each, state a decision or action and its consequence, citing "
-        "the event IDs covering those moments. Use the dialogue to check names, allegiances "
-        "and outcomes when the rough visual notes conflict. Leave uncertain identities "
-        "unspecified. Earlier sections supply context. Leave out routine activity, repeated "
-        "descriptions and credits. Return no beats when this range contains only filler. "
-        "In the final section, distinguish the outcome of the conflict from the protagonist's final choice."
-    ), {"dialogue": dialogue, "visual_notes": events, "earlier_sections": earlier, "final": final},
-        max_tokens=1800)
-
-
 def narrate_selected(segments, earlier):
     result = ask(NarrationBatch, (
         "Write a continuous English movie recap for these selected scenes in input order. "
@@ -143,40 +135,10 @@ def narrate_selected(segments, earlier):
     return [line.text for line in result.segments]
 
 
-def draft(events, chapter, story, seconds, words, feedback, *, frames, duration):
-    return ask(Draft, (
-        "Write only this chapter of a continuous English movie recap. Include each of its "
-        "numbered beats in ascending order and put that number in beat. Follow the order "
-        "the viewer learns what happens, including flashbacks where the film tells them. "
-        "Connect actions to their consequences. Use the whole-film synopsis for continuity "
-        "without revealing later events early. Treat the chapter's beat plan as the factual source. "
-        "Do not invent identities, motives, or outcomes. Use the event times only to select footage. "
-        "Tell the story the way you would tell it to a friend. Use plain spoken English, vary "
-        "sentence length, and carry the thought across adjacent segments. Once a character is "
-        "introduced, use their first name or a pronoun where clear. Give specific actions "
-        "and consequences. Leave out camera directions, plot-analysis labels and stock commentary. "
-        "Spend more words on decisions, reversals and their consequences. Treat the supplied word count "
-        "as a guide. Do not fill it with detours, repeated explanations or descriptions of individual movements. "
-        "Write narration only in text. For each segment give ordered, non-overlapping candidate "
-        "source intervals in absolute seconds, using only the event IDs listed for that beat. "
-        "Use the timed frames and dialogue to locate the named person, action or reaction the audience "
-        "needs to see. Keep each interval inside its event. For a single shot, put the strongest "
-        "match first and make it long enough to cover the speech. When a paragraph moves from cause "
-        "to consequence across shots, set use_all_candidates=true and give the shots in viewing order. "
-        "Keep the earlier shots short enough to reach the later shot while its action is being narrated. "
-        "Allow about one second of footage for every three words. Keep source times increasing "
-        "across segments and avoid reusing footage. "
-        "If this is the final chapter, close with the resolution."
-    ), {"target_seconds": seconds, "target_words": words, "target_segments": min(12, max(1, round(words / 40))),
-        "feedback": feedback,
-        "story": story, "chapter": chapter, "events": events, "sample_seconds": [index for index, _ in frames]},
-        frames=frames, duration=duration, max_tokens=3200)
-
-
-def shorten(text, duration, available):
+def shorten(text, duration, available, *, factor=0.9):
     return ask(Narration, (
         "Shorten this English narration while keeping the main action and result. "
         "Keep the conversational delivery and the connection to the next action. "
         "Return only the revised narration in text. Stay within the target word count."
-    ), {"text": text, "target_words": max(1, int(len(text.split()) * available / duration * 0.9))},
+    ), {"text": text, "target_words": max(1, int(len(text.split()) * available / duration * factor))},
         max_tokens=512).text
