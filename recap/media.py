@@ -57,11 +57,11 @@ def probe(movie):
     return info
 
 
-def read_subtitles(content, offset=0):
+def read_subtitles(content):
     try:
         return [
-            {"index": item.index, "start": item.start.total_seconds() + offset,
-             "end": item.end.total_seconds() + offset, "text": item.content}
+            {"index": item.index, "start": item.start.total_seconds(),
+             "end": item.end.total_seconds(), "text": item.content}
             for item in srt.parse(content.decode("utf-8-sig"))
         ]
     except (srt.SRTParseError, UnicodeDecodeError) as error:

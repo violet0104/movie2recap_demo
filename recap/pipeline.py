@@ -383,7 +383,8 @@ def generate(project, job, movie, version):
     progress(project, job, "probe")
     media = probe(movie)
     write_json(analysis / "media.json", media)
-    dialogue = read_subtitles((project / "source" / "dialogue.srt").read_bytes(), job["settings"]["subtitle_offset"])
+    subtitles_path = project / "source" / "dialogue.srt"
+    dialogue = read_subtitles(subtitles_path.read_bytes()) if subtitles_path.is_file() else []
     job["duration"] = media["duration"]
     directory = analysis / f"recap-{version}"
     directory.mkdir(exist_ok=True)

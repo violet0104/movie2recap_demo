@@ -389,3 +389,48 @@ def test_worker_run_writes_run_log_and_pipeline_edit_enforces_budget(tmp_path, m
     assert store.read_json(proj / "timeline.json")["duration"] == pytest.approx(7.0)
     run_log = (proj / "analysis" / "run.log").read_text(encoding="utf-8")
     assert "task edit finished" in run_log
+
+
+def test_generate_works_without_subtitles_and_without_offset(tmp_path, monkeypatch):
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    monkeypatch.setattr(store, "PROJECTS", projects_dir)
+    monkeypatch.setattr(api, "PROJECTS", projects_dir)
+
+    client = TestClient(api.app)
+    pid = client.post("/api/projects").json()["id"]
+
+    # Cannot generate before movie upload completes
+    assert client.post(f"/api/projects/{pid}/generate").status_code == 409
+
+    # Upload movie only (no subtitles)
+    res = client.put(f"/api/projects/{pid}/movie?name=clip.mp4&offset=0&total=8", content=b"12345678")
+    assert res.status_code == 200
+    assert res.json()["complete"] is True
+
+    # Generate succeeds without subtitles and without subtitle_offset
+    gen = client.post(f"/api/projects/{pid}/generate")
+    assert gen.status_code == 202
+    assert gen.json()["status"] == "queued"
+    assert gen.json()["subtitles"] is None
+
+    # pipeline.generate passes empty dialogue list when dialogue.srt is absent
+    proj = projects_dir / pid
+    job = store.read_json(proj / "job.json")
+    seen_dialogue = []
+
+    monkeypatch.setattr(pipeline, "probe", lambda movie: {"duration": 100.0, "width": 1280, "height": 720})
+
+    def fake_caption_movie(project, job_arg, movie, dialogue):
+        seen_dialogue.append(dialogue)
+        cap_path = project / "analysis" / "caption.json"
+        store.write_json(cap_path, {"segments": []})
+        return cap_path
+
+    monkeypatch.setattr(pipeline, "caption_movie", fake_caption_movie)
+    monkeypatch.setattr(pipeline, "select_captions", lambda p, j, c: {"selected_segments": []})
+    monkeypatch.setattr(pipeline, "write_selected_timeline", lambda p, j, d, s, dlg, v: {"version": v, "dialogue_len": len(dlg)})
+
+    out = pipeline.generate(proj, job, proj / "source" / "movie.mp4", 1)
+    assert seen_dialogue == [[]]
+    assert out["dialogue_len"] == 0

@@ -120,10 +120,9 @@ function UploadView({ id, job, open, update }: {
     event.preventDefault();
     setUploading("movie");
     setError("");
-    const values = new FormData(event.currentTarget);
     try {
-      if ((!job?.movie?.complete && !movie) || (!job?.subtitles && !subtitles)) {
-        throw new Error("请选择原片和对应的 SRT 字幕");
+      if (!job?.movie?.complete && !movie) {
+        throw new Error("请选择电影原片");
       }
       let project = id;
       if (!project) {
@@ -138,9 +137,7 @@ function UploadView({ id, job, open, update }: {
         setSubtitleSaved(true);
       }
       setUploading("generate");
-      update(await request<Job>(`${base}/generate`, json("POST", {
-        subtitle_offset: Number(values.get("offset")),
-      })));
+      update(await request<Job>(`${base}/generate`, { method: "POST" }));
     } catch (failure) {
       setError((failure as Error).message);
     } finally {
@@ -149,20 +146,19 @@ function UploadView({ id, job, open, update }: {
   }
 
   return <>
-    <header className="page-heading"><h1>制作电影解说</h1><p>上传原片和对白字幕，生成带英文旁白的解说视频。</p></header>
+    <header className="page-heading"><h1>制作电影解说</h1><p>上传原片（可选附带对白字幕），生成带英文旁白的解说视频。</p></header>
     <div className="layout">
       <form className="panel form-panel" onSubmit={submit}>
         <h2>项目素材</h2>
         <FileField title="电影原片" accept=".mp4,.mkv" formats="MP4 / MKV" saved={job?.movie?.name}
           disabled={busy || job?.movie?.complete} onChange={(file) => { setMovie(file); setSent(null); }} />
-        <FileField title="对白字幕" accept=".srt" formats="SRT · UTF-8" saved={job?.subtitles}
+        <FileField title="对白字幕（可选）" accept=".srt" formats="SRT · UTF-8 · 可不传" saved={job?.subtitles}
           disabled={busy} onChange={(file) => { setSubtitles(file); setSubtitleSaved(false); }} />
-        <label>字幕偏移（秒）<input name="offset" type="number" step="0.1" defaultValue="0" required /></label>
         <p className="meta">选段总时长上限为原片的 8%。</p>
         <div className="progress-grid">
           <ProgressRow title="上传原片" value={received} max={total || 1} />
-          <ProgressRow title="上传字幕"
-            value={uploading === "subtitles" ? undefined : Number(subtitleSaved || (!subtitles && !!job?.subtitles))} />
+          {(subtitles || subtitleSaved || job?.subtitles) && <ProgressRow title="上传字幕"
+            value={uploading === "subtitles" ? undefined : Number(subtitleSaved || (!subtitles && !!job?.subtitles))} />}
         </div>
         {error && <Notice>{error}</Notice>}
         <button className="primary" disabled={busy}>{busy ? "正在提交素材…" : received && percent < 100 ? "续传并生成" : "开始生成"}</button>
