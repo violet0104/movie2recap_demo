@@ -13,7 +13,7 @@ export type Job = {
   timeline_version: number | null;
   asset_version: number | null;
   error: string | null;
-  task: { kind: TaskKind; keep_script?: boolean } | null;
+  task: { kind: TaskKind } | null;
   last_task?: TaskKind;
   stage_progress?: { done: number; total: number } | null;
 };
@@ -29,7 +29,7 @@ export type Segment = SourceRange & {
   clips: SourceRange[];
   event_ids: string[];
 };
-export type Timeline = { version: number; duration: number; segments: Segment[] };
+export type Timeline = { version: number; duration: number; duration_budget?: number; segments: Segment[] };
 
 class RequestError extends Error {
   constructor(public status: number, message: string) {

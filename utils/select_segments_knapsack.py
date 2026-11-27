@@ -73,7 +73,7 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(
-        f"Selected {len(selected)} segments, "
+        f"Selected {len(result['selected_segments'])} segments, "
         f"{result['selected_duration']}/{result['target_duration']}s: {output}"
     )
 

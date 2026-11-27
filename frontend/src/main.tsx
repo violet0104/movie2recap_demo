@@ -7,7 +7,6 @@ const stages: Record<string, string> = {
   queued: "等待任务进程",
   probe: "读取原片与字幕",
   events: "生成分段描述",
-  story: "梳理全片主线",
   scoring: "DeepSeek 评分",
   selection: "按 8% 预算选段",
   script: "撰写英文解说",
@@ -22,7 +21,7 @@ const taskStages: Record<TaskKind, { title: string; steps: string[] }> = {
   edit: { title: "修改进度", steps: ["editing"] },
   export: { title: "导出进度", steps: ["render", "encode"] },
 };
-const progressUnits: Record<string, string> = { story: "章", script: "章", audio: "段", render: "个镜头" };
+const progressUnits: Record<string, string> = { script: "段", audio: "段", render: "个镜头" };
 
 function ProgressRow({ title, value, max = 1, detail, failed }: {
   title: string;
@@ -39,10 +38,7 @@ function ProgressRow({ title, value, max = 1, detail, failed }: {
 }
 
 function TaskProgress({ job }: { job: Job }) {
-  const task = taskStages[job.task?.kind ?? job.last_task ?? "generate"];
-  const reviewed = job.task?.keep_script;
-  const { title } = task;
-  const steps = reviewed ? ["probe", "story", "script", "audio", "render", "encode"] : task.steps;
+  const { title, steps } = taskStages[job.task?.kind ?? job.last_task ?? "generate"];
   const current = steps.indexOf(job.stage);
   const ready = job.status === "ready";
   return <section className="panel task-progress" aria-label={title}>
@@ -62,7 +58,7 @@ function TaskProgress({ job }: { job: Job }) {
         let detail: string | undefined;
         if (time) detail = `${timecode(time.done)} / ${timecode(time.total)} · ${job.event_count} 条事件`;
         else if (count && step === "encode") detail = `${timecode(count.done)} / ${timecode(count.total)}`;
-        else if (count) detail = `${count.done} / ${count.total} ${step === "script" && !reviewed ? "段" : progressUnits[step]}`;
+        else if (count) detail = `${count.done} / ${count.total} ${progressUnits[step]}`;
         if (failed) detail = detail ? `失败 · ${detail}` : "失败";
         return <ProgressRow key={step} title={stages[step]} value={value ?? (failed ? 0 : undefined)}
           max={max} detail={detail} failed={failed} />;
@@ -187,8 +183,9 @@ function Placeholder({ title, detail }: { title: string; detail: string }) {
   </div>;
 }
 
-function SegmentEditor({ segment, busy, preview, save }: {
+function SegmentEditor({ segment, remainingBudget, busy, preview, save }: {
   segment: Segment;
+  remainingBudget: number | null;
   busy: boolean;
   preview: (candidate: Candidate, start?: number, end?: number) => void;
   save: (text: string, start: number, end: number, candidateId: string) => void;
@@ -200,12 +197,16 @@ function SegmentEditor({ segment, busy, preview, save }: {
   const dirty = text !== segment.text || Number(start) !== segment.source.start || Number(end) !== segment.source.end
     || candidate !== segment.candidate_id;
   const valid = start !== "" && end !== "" && Number(start) >= 0 && Number(end) > Number(start);
+  const currentLength = segment.source.end - segment.source.start;
+  const nextLength = valid ? Number(end) - Number(start) : currentLength;
+  const delta = nextLength - currentLength;
+  const overBudget = remainingBudget !== null && delta > remainingBudget + 0.05;
   return <form className="editor" onSubmit={(event) => {
     event.preventDefault();
     save(text, Number(start), Number(end), candidate);
   }}>
     <label>英文旁白<textarea lang="en" required rows={4} value={text} onChange={(event) => setText(event.target.value)} /></label>
-    <label>候选镜头
+    {segment.candidates.length > 1 && <label>候选镜头
       <select value={candidate} onChange={(event) => {
         const shot = segment.candidates.find((item) => item.id === event.target.value)!;
         setCandidate(shot.id);
@@ -216,11 +217,12 @@ function SegmentEditor({ segment, busy, preview, save }: {
           {timecode(shot.start, true)} – {timecode(shot.end, true)} · {shot.event_id}
         </option>)}
       </select>
-    </label>
+    </label>}
     <div className="fields">
       <label>原片入点（秒）<input type="number" min="0" step="any" required value={start} onChange={(event) => setStart(event.target.value)} /></label>
       <label>原片出点（秒）<input type="number" min="0" step="any" required value={end} onChange={(event) => setEnd(event.target.value)} /></label>
     </div>
+    {overBudget && <Notice>{`当前区间比原段多 ${(delta).toFixed(1)} 秒，可能超出 8% 预算（剩余 ${Math.max(0, remainingBudget).toFixed(1)} 秒）。`}</Notice>}
     <div className="actions">
       <button type="button" className="secondary" disabled={!valid} onClick={() => {
         preview(segment.candidates.find((shot) => shot.id === candidate)!, Number(start), Number(end));
@@ -302,7 +304,15 @@ function ProjectView({ job, timeline, update }: { job: Job; timeline: Timeline |
         </div>}
       </section>
       {segment && timeline && <section className="panel timeline-panel">
-        <div className="panel-heading"><h2>英文旁白</h2><span className="mono meta">v{timeline.version} · {timecode(timeline.duration)}</span></div>
+        <div className="panel-heading">
+          <h2>英文旁白</h2>
+          <span className="mono meta">
+            {`v${timeline.version} · ${timecode(timeline.duration)}`}
+            {timeline.duration_budget != null
+              ? ` / ${timecode(timeline.duration_budget)}（剩余 ${Math.max(0, timeline.duration_budget - timeline.duration).toFixed(1)}s）`
+              : ""}
+          </span>
+        </div>
         <div className="segments" aria-label="选择旁白段落">
           {timeline.segments.map((item) => <button key={item.id} type="button" aria-pressed={item.id === segment.id} className="segment" onClick={() => {
             setSelected(item.id);
@@ -313,7 +323,9 @@ function ProjectView({ job, timeline, update }: { job: Job; timeline: Timeline |
             <span className="meta mono">原片 {item.clips.map((shot) => `${timecode(shot.start, true)}–${timecode(shot.end, true)}`).join(" / ")}</span>
           </button>)}
         </div>
-        <SegmentEditor key={`${timeline.version}-${segment.id}`} segment={segment} busy={busy} preview={preview}
+        <SegmentEditor key={`${timeline.version}-${segment.id}`} segment={segment}
+          remainingBudget={timeline.duration_budget != null ? timeline.duration_budget - timeline.duration : null}
+          busy={busy} preview={preview}
           save={(text, start, end, candidateId) => void submit("/timeline", "PATCH", {
             version: timeline.version, segment_id: segment.id, text, start, end, candidate_id: candidateId,
           })} />
@@ -327,23 +339,32 @@ function App() {
   const [job, setJob] = useState<Job | null>(null);
   const [timeline, setTimeline] = useState<Timeline | null>(null);
   const [loadError, setLoadError] = useState("");
+  const polling = !job || job.status === "queued" || job.status === "running";
 
   useEffect(() => {
-    if (!id) return;
+    if (!id || !polling) return;
     let alive = true;
     let timer: number;
     async function poll() {
       try {
         const result = await request<Job>(projectUrl(id!));
-        if (alive) { setJob(result); setLoadError(""); }
+        if (alive) {
+          setJob(result);
+          setLoadError("");
+          if (result.status === "queued" || result.status === "running") {
+            timer = window.setTimeout(poll, 1500);
+          }
+        }
       } catch (error) {
-        if (alive) setLoadError((error as Error).message);
+        if (alive) {
+          setLoadError((error as Error).message);
+          timer = window.setTimeout(poll, 1500);
+        }
       }
-      if (alive) timer = window.setTimeout(poll, 1500);
     }
     void poll();
     return () => { alive = false; clearTimeout(timer); };
-  }, [id]);
+  }, [id, polling]);
 
   useEffect(() => {
     if (!id || !job?.timeline_version || timeline?.version === job.timeline_version) return;

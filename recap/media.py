@@ -64,8 +64,36 @@ def read_subtitles(content, offset=0):
              "end": item.end.total_seconds() + offset, "text": item.content}
             for item in srt.parse(content.decode("utf-8-sig"))
         ]
-    except srt.SRTParseError as error:
-        raise ValueError(str(error)) from error
+    except (srt.SRTParseError, UnicodeDecodeError) as error:
+        raise ValueError("字幕须为 UTF-8 编码的有效 SRT") from error
+
+
+def check_media_tools():
+    errors = []
+    warnings = []
+    try:
+        run([FFPROBE, "-version"])
+    except (OSError, RuntimeError) as error:
+        errors.append(f"ffprobe 不可用: {error}")
+    try:
+        run([FFMPEG, "-version"])
+        filters = run([FFMPEG, "-hide_banner", "-filters"])
+        if not any(line.split()[1] == "subtitles" for line in filters.splitlines() if len(line.split()) >= 2):
+            errors.append("ffmpeg 缺少 subtitles (libass) 滤镜")
+        encoders = run([FFMPEG, "-hide_banner", "-encoders"])
+        encoder_names = {line.split()[1] for line in encoders.splitlines() if len(line.split()) >= 2}
+        for codec in ("libx264", "aac"):
+            if codec not in encoder_names:
+                errors.append(f"ffmpeg 缺少 {codec} 编码器")
+    except (OSError, RuntimeError) as error:
+        errors.append(f"ffmpeg 不可用: {error}")
+    try:
+        matched = run(["fc-match", "DejaVu Sans"]).strip()
+        if "DejaVu" not in matched:
+            warnings.append(f"未检测到 DejaVu Sans 字体，当前回退为: {matched}")
+    except (OSError, RuntimeError):
+        warnings.append("未能通过 fc-match 检查 DejaVu Sans 字体")
+    return {"ok": not errors, "errors": errors, "warnings": warnings}
 
 
 def window_dialogue(dialogue, start, end):

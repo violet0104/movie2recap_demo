@@ -76,7 +76,16 @@ ssh -N -o ExitOnForwardFailure=yes -J <用户>@<登录节点>:<SSH端口> \
 | `RECAP_FFMPEG` / `RECAP_FFPROBE` | `ffmpeg` / `ffprobe` |
 | `RECAP_MODEL_URL` | `http://127.0.0.1:8001/v1` |
 | `RECAP_MODEL` | `Qwen/Qwen3-VL-8B-Instruct` |
+| `RECAP_MODEL_MAX_RETRIES` | `3`，本地模型服务请求失败重试次数 |
+| `RECAP_CLEANUP_FRAMES` | `0`，设为 `1` 时在全片描述完成后自动清理 `analysis/frames/` |
+| `RECAP_SKIP_PREFLIGHT` | `0`，设为 `1` 时跳过任务进程启动自检 |
 | `DEEPSEEK_API_KEY` | 由部署环境提供，用于发送分段描述和时间码进行评分 |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` |
+| `DEEPSEEK_MODEL` | `deepseek-flash` |
+| `DEEPSEEK_THINKING` / `DEEPSEEK_REASONING_EFFORT` | `1` / `high`，设为 `0` 可关闭 thinking 参数 |
+| `DEEPSEEK_MAX_RETRIES` | `3`，评分请求重试次数 |
+
+可通过 `GET /api/health` 查看 Web、Worker 与模型服务的连通状态，通过 `DELETE /api/projects/{id}` 清理闲置项目数据；各阶段耗时和错误摘要会记录在项目的 `analysis/run.log`。
 
 Web 服务和任务进程使用同一数据目录。媒体工具路径可设置为可执行文件的绝对路径。迁移时携带源码、锁文件、`frontend/dist/`、项目数据、模型权重和 Hugging Face 缓存，然后在目标机重建环境。
 
