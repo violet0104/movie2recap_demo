@@ -44,15 +44,15 @@ def test_knapsack_cli_main_runs_without_name_error(tmp_path):
     assert [s["segment_id"] for s in saved["selected_segments"]] == [1, 2]
 
 
-def test_score_caption_uses_qwen_env_retries_fence_and_clamping(monkeypatch):
+def test_score_caption_uses_qwen_fixed_key_schema_retries_and_clamping(monkeypatch):
     monkeypatch.setenv("RECAP_MODEL_URL", "http://127.0.0.1:9001/v1/")
     monkeypatch.setenv("RECAP_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
 
     calls = []
     responses = [
         _make_response(429, "rate limited"),
-        _make_response(200, {"choices": [{"finish_reason": "stop", "message": {"content": '{"scores": [0.5]}'}}]}),
-        _make_response(200, {"choices": [{"finish_reason": "stop", "message": {"content": '```json\n{"scores": [-0.2, 1.456]}\n```'}}]}),
+        _make_response(200, {"choices": [{"finish_reason": "stop", "message": {"content": '{"0": 50}'}}]}),
+        _make_response(200, {"choices": [{"finish_reason": "stop", "message": {"content": '```json\n{"0": -5, "1": 145}\n```'}}]}),
     ]
 
     def fake_post(url, *, json, timeout, trust_env):
@@ -70,9 +70,42 @@ def test_score_caption_uses_qwen_env_retries_fence_and_clamping(monkeypatch):
     assert len(calls) == 3
     assert calls[0][0] == "http://127.0.0.1:9001/v1/chat/completions"
     assert calls[0][1]["model"] == "Qwen/Qwen3-VL-8B-Instruct"
-    assert calls[0][1]["response_format"]["type"] == "json_schema"
+    schema = calls[0][1]["response_format"]["json_schema"]["schema"]
+    assert schema["required"] == ["0", "1"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["0"] == {"type": "integer", "minimum": 0, "maximum": 100}
     assert calls[0][2] is False
     assert [item["score"] for item in scored] == [0.0, 1.0]
+
+
+def test_score_caption_batches_and_bisects_on_length(monkeypatch):
+    monkeypatch.setattr(score_caption.time, "sleep", lambda _: None)
+    seen_batches = []
+
+    def fake_post(url, *, json, timeout, trust_env):
+        keys = json["response_format"]["json_schema"]["schema"]["required"]
+        seen_batches.append(keys)
+        if len(keys) > 20:
+            return _make_response(200, {"choices": [{"finish_reason": "length", "message": {"content": "{truncated"}}]})
+        return _make_response(200, {"choices": [{
+            "finish_reason": "stop",
+            "message": {"content": json_lib.dumps({k: int(k) * 2 for k in keys})},
+        }]})
+
+    json_lib = json
+    monkeypatch.setattr(score_caption.httpx, "post", fake_post)
+
+    captions = [
+        {"segment_id": i, "start": float(i), "end": float(i + 1), "caption": f"scene {i}"}
+        for i in range(45)
+    ]
+    scored = score_caption.score(captions, batch_size=30, max_retries=2, backoff=0.0)
+    # Batch 1 (30 items) hits length -> bisected into 15 + 15; Batch 2 (15 items) succeeds directly
+    assert [len(b) for b in seen_batches] == [30, 15, 15, 15]
+    assert len(scored) == 45
+    assert scored[0]["score"] == 0.0
+    assert scored[25]["score"] == 0.5
+    assert scored[44]["score"] == 0.88
 
 
 def test_score_caption_does_not_retry_400(monkeypatch):
