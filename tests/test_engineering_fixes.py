@@ -467,3 +467,31 @@ def test_generate_works_without_subtitles_and_without_offset(tmp_path, monkeypat
     out = pipeline.generate(proj, job, proj / "source" / "movie.mp4", 1)
     assert seen_dialogue == [[]]
     assert out["dialogue_len"] == 0
+
+
+def test_narrate_selected_uses_fixed_key_schema_and_bisects_on_mismatch(monkeypatch):
+    seen_calls = []
+
+    def fake_post(url, *, json, timeout, trust_env):
+        schema = json["response_format"]["json_schema"]["schema"]
+        keys = schema["required"]
+        seen_calls.append(keys)
+        # Simulate count mismatch / bad output on 4-scene batch, succeeding once bisected to 2 + 2
+        if len(keys) == 4:
+            return _make_response(200, {"choices": [{"finish_reason": "stop", "message": {"content": '{"1": "only one"}'}}]})
+        return _make_response(200, {"choices": [{
+            "finish_reason": "stop",
+            "message": {"content": json_lib.dumps({k: f"Narration {len(seen_calls)}-{k}." for k in keys})},
+        }]})
+
+    json_lib = json
+    monkeypatch.setattr(model.httpx, "post", fake_post)
+
+    scenes = [
+        {"caption": f"Scene {i}", "dialogue": [], "max_words": 15}
+        for i in range(4)
+    ]
+    texts = model.narrate_selected(scenes, ["Prev."])
+    assert seen_calls == [["1", "2", "3", "4"], ["1", "2"], ["1", "2"]]
+    assert len(texts) == 4
+    assert all(texts)
