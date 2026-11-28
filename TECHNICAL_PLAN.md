@@ -42,7 +42,7 @@ FFmpeg 按每秒一帧生成 `384×216` 分析帧。Qwen3-VL 默认每次读取 
 
 任务进程调用 `utils/score_caption.py` 读入全部片段描述，复用本地 `Qwen3-VL` 模型服务（`RECAP_MODEL_URL` / `RECAP_MODEL`）参考全片内容为每段评分，并保存 `analysis/caption_score.json`。评分请求发送文本和时间码，并使用 JSON Schema 约束输出格式。
 
-`utils/select_segments_knapsack.py` 以原片时长的 8% 为预算，在预算内最大化所选片段的总分，并按起点排序，保存为 `analysis/selected_segments.json`。Qwen 结合选中片段的描述和对白撰写连续的英文旁白，每个片段对应一段旁白。网页保留原片入点和出点，供审看和编辑。
+`utils/select_segments_knapsack.py` 以原片时长的 8% 为预算，默认过滤短于 2 秒的碎片（可通过 `RECAP_MIN_SEGMENT_SECONDS` 调整），在预算内最大化所选片段的时长加权得分（`score × duration`），并按起点排序，保存为 `analysis/selected_segments.json`。Qwen 结合选中片段的描述和对白撰写连续的英文旁白，每个片段对应一段旁白。网页保留原片入点和出点，供审看和编辑。
 
 ## 5. 配音、字幕和成片时间线
 
