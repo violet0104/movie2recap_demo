@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 import time
 from math import ceil
 
@@ -62,7 +63,15 @@ def check_model_server(timeout: float = 5.0) -> dict:
         return {"ok": False, "url": MODEL_URL, "error": str(error)}
 
 
-def ask(schema, prompt, data, *, frames=None, duration=None, max_tokens=4096, max_retries=None, backoff=1.0):
+def _strip_code_fence(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _request_completion(schema_name, json_schema, prompt, data, *, frames=None, duration=None, max_tokens=4096, max_retries=None, backoff=1.0):
     content = [{"type": "text", "text": f"{prompt}\n\n{json.dumps(data, ensure_ascii=False)}"}]
     payload = {
         "model": MODEL,
@@ -71,7 +80,7 @@ def ask(schema, prompt, data, *, frames=None, duration=None, max_tokens=4096, ma
         "max_tokens": max_tokens,
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": schema.__name__, "schema": schema.model_json_schema()},
+            "json_schema": {"name": schema_name, "schema": json_schema},
         },
     }
     if frames:
@@ -101,9 +110,18 @@ def ask(schema, prompt, data, *, frames=None, duration=None, max_tokens=4096, ma
             raise last_error
         choice = response.json()["choices"][0]
         if choice["finish_reason"] == "length":
-            raise ModelOutputTooLong(f"模型输出超过长度限制（{schema.__name__}，{max_tokens} tokens）")
-        return schema.model_validate_json(choice["message"]["content"])
+            raise ModelOutputTooLong(f"模型输出超过长度限制（{schema_name}，{max_tokens} tokens）")
+        return choice["message"]["content"]
     raise last_error
+
+
+def ask(schema, prompt, data, *, frames=None, duration=None, max_tokens=4096, max_retries=None, backoff=1.0):
+    raw = _request_completion(
+        schema.__name__, schema.model_json_schema(), prompt, data,
+        frames=frames, duration=duration, max_tokens=max_tokens,
+        max_retries=max_retries, backoff=backoff,
+    )
+    return schema.model_validate_json(raw)
 
 
 def caption_batch(frames, duration, start, end, dialogue):
@@ -122,17 +140,69 @@ def caption_batch(frames, duration, start, end, dialogue):
     }, frames=frames, duration=duration, max_tokens=8192).segments
 
 
+def _narration_batch_schema(keys):
+    return {
+        "type": "object",
+        "properties": {key: {"type": "string", "minLength": 1} for key in keys},
+        "required": keys,
+        "additionalProperties": False,
+    }
+
+
+def _parse_narration_batch(raw, keys):
+    parsed = json.loads(_strip_code_fence(raw))
+    if isinstance(parsed, dict) and all(isinstance(parsed.get(key), str) for key in keys):
+        texts = [parsed[key].strip() for key in keys]
+        if all(texts):
+            return texts
+    if isinstance(parsed, dict) and isinstance(parsed.get("segments"), list) and len(parsed["segments"]) == len(keys):
+        texts = [
+            item["text"].strip()
+            for item in parsed["segments"]
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+        if len(texts) == len(keys) and all(texts):
+            return texts
+    raise ValueError(f"英文旁白段数与选中的片段数不一致（期望 {len(keys)} 段）")
+
+
 def narrate_selected(segments, earlier):
-    result = ask(NarrationBatch, (
+    if not segments:
+        return []
+    keys = [str(index) for index in range(1, len(segments) + 1)]
+    labeled = [{"scene_id": key, **scene} for key, scene in zip(keys, segments)]
+    prompt = (
         "Write a continuous English movie recap for these selected scenes in input order. "
-        "Return exactly one spoken paragraph for each scene. Describe the action and its consequence, "
-        "and use the previous narration for continuity. Use the caption and any provided timed dialogue as evidence. "
-        "Use a name only when the evidence supports it. Stay within each scene's word limit "
+        f"Return a JSON object mapping each scene_id ({keys[0]}..{keys[-1]}) to exactly one concise "
+        "spoken English paragraph for that scene. Describe the action and its consequence, "
+        "and use previous_narration for continuity. Use the caption and any provided timed dialogue as evidence. "
+        "Use a name only when the evidence supports it. Stay within each scene's max_words limit "
         "so the narration fits the selected footage."
-    ), {"scenes": segments, "previous_narration": earlier}, max_tokens=2400)
-    if len(result.segments) != len(segments):
-        raise ValueError("英文旁白段数与选中的片段数不一致")
-    return [line.text for line in result.segments]
+    )
+    max_tokens = max(2400, len(segments) * 260)
+    try:
+        raw = _request_completion(
+            "NarrationBatchMap",
+            _narration_batch_schema(keys),
+            prompt,
+            {"scenes": labeled, "previous_narration": earlier},
+            max_tokens=max_tokens,
+        )
+        return _parse_narration_batch(raw, keys)
+    except (ModelOutputTooLong, ValueError, json.JSONDecodeError):
+        if len(segments) > 1:
+            mid = len(segments) // 2
+            left = narrate_selected(segments[:mid], earlier)
+            right = narrate_selected(segments[mid:], (list(earlier) + left)[-2:])
+            return left + right
+        raw = _request_completion(
+            "NarrationBatchMap",
+            _narration_batch_schema(keys),
+            prompt,
+            {"scenes": labeled, "previous_narration": earlier},
+            max_tokens=max_tokens,
+        )
+        return _parse_narration_batch(raw, keys)
 
 
 def shorten(text, duration, available, *, factor=0.9):
