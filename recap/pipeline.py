@@ -1,5 +1,8 @@
+from array import array
+import json
 import os
 import re
+import sys
 import textwrap
 import time
 import wave
@@ -22,6 +25,7 @@ NARRATION_BATCH = 12
 GAP = round(0.16 * SAMPLE_RATE)
 SHORTEN_FACTORS = (0.85, 0.72, 0.58)
 MAX_TTS_SPEED = 1.25
+EMERGENCY_TTS_SPEED = 1.50
 
 
 def _caption_batch_frames():
@@ -272,10 +276,7 @@ class ShortFootage(ValueError):
         super().__init__(f"旁白需要 {needed:.2f} 秒，可用画面 {available:.2f} 秒。请缩短旁白或扩大剪辑区间。")
 
 
-def voice_segment(project, segment, *, full_source=False, allow_trim_gap=False, speed=1.0):
-    raw_cues = speak(project, segment["text"]) if speed == 1.0 else speak(project, segment["text"], speed=speed)
-    cues = [dict(cue) for cue in raw_cues]
-    required = ceil(sum(cue["samples"] + cue["gap_after"] for cue in cues) / SAMPLES_PER_FRAME)
+def _segment_ranges_and_capacities(segment):
     selected = next(shot for shot in segment["candidates"] if shot["id"] == segment["candidate_id"])
     if segment.get("use_all_candidates"):
         alternatives = segment["candidates"][1:]
@@ -286,14 +287,10 @@ def voice_segment(project, segment, *, full_source=False, allow_trim_gap=False, 
         ]
     ranges = available_ranges(segment["source"], alternatives)
     capacities = [floor((shot["end"] - shot["start"]) * FPS + 1e-8) for shot in ranges]
-    total_capacity = sum(capacities)
-    if total_capacity < required and allow_trim_gap and cues and cues[-1].get("gap_after", 0) > 0:
-        cues[-1]["gap_after"] = 0
-        required = ceil(sum(cue["samples"] + cue["gap_after"] for cue in cues) / SAMPLES_PER_FRAME)
-    if total_capacity < required:
-        raise ShortFootage(required / FPS, total_capacity / FPS)
-    if full_source:
-        required = total_capacity
+    return ranges, capacities
+
+
+def _build_clips(ranges, capacities, required):
     clips = []
     for shot, capacity in zip(ranges, capacities, strict=True):
         length = min(required, capacity)
@@ -302,6 +299,70 @@ def voice_segment(project, segment, *, full_source=False, allow_trim_gap=False, 
             required -= length
         if not required:
             break
+    return clips
+
+
+def _silent_segment(segment, text):
+    ranges, capacities = _segment_ranges_and_capacities(segment)
+    return {**segment, "text": text, "cues": [], "clips": _build_clips(ranges, capacities, sum(capacities))}
+
+
+def _trim_cues_silence(project, cues, *, threshold=120, margin_samples=480):
+    trimmed = False
+    for cue in cues:
+        audio_name = cue.get("audio")
+        if not audio_name:
+            continue
+        audio_path = project / "audio" / audio_name
+        if not audio_path.is_file():
+            continue
+        offset = int(cue.get("audio_offset", 0))
+        length = int(cue.get("samples", 0))
+        if length <= SAMPLES_PER_FRAME:
+            continue
+        with wave.open(str(audio_path), "rb") as audio:
+            if audio.getsampwidth() != 2 or audio.getnchannels() != 1:
+                continue
+            audio.setpos(offset)
+            raw = audio.readframes(length)
+        pcm = array("h")
+        pcm.frombytes(raw)
+        if sys.byteorder == "big":
+            pcm.byteswap()
+        if not pcm:
+            continue
+        first = next((i for i, sample in enumerate(pcm) if abs(sample) >= threshold), None)
+        if first is None:
+            continue
+        last = next((i for i in range(len(pcm) - 1, -1, -1) if abs(pcm[i]) >= threshold), first)
+        new_start = max(0, first - margin_samples)
+        new_end = min(len(pcm), last + 1 + margin_samples)
+        if new_end - new_start < SAMPLES_PER_FRAME:
+            new_end = min(len(pcm), new_start + SAMPLES_PER_FRAME)
+        if new_start > 0 or new_end < len(pcm):
+            cue["audio_offset"] = offset + new_start
+            cue["samples"] = new_end - new_start
+            trimmed = True
+    return trimmed
+
+
+def voice_segment(project, segment, *, full_source=False, allow_trim_gap=False, speed=1.0):
+    raw_cues = speak(project, segment["text"]) if speed == 1.0 else speak(project, segment["text"], speed=speed)
+    cues = [dict(cue) for cue in raw_cues]
+    required = ceil(sum(cue["samples"] + cue["gap_after"] for cue in cues) / SAMPLES_PER_FRAME)
+    ranges, capacities = _segment_ranges_and_capacities(segment)
+    total_capacity = sum(capacities)
+    if total_capacity < required and allow_trim_gap and cues and cues[-1].get("gap_after", 0) > 0:
+        cues[-1]["gap_after"] = 0
+        required = ceil(sum(cue["samples"] + cue["gap_after"] for cue in cues) / SAMPLES_PER_FRAME)
+    if total_capacity < required and allow_trim_gap and cues:
+        if _trim_cues_silence(project, cues):
+            required = ceil(sum(cue["samples"] + cue["gap_after"] for cue in cues) / SAMPLES_PER_FRAME)
+    if total_capacity < required:
+        raise ShortFootage(required / FPS, total_capacity / FPS)
+    if full_source:
+        required = total_capacity
+    clips = _build_clips(ranges, capacities, required)
     return {**segment, "cues": cues, "clips": clips}
 
 
@@ -369,6 +430,8 @@ def fit_narration(project, segment, path, *, full_source=False):
         if path.is_file():
             cached_data = read_json(path)
             cached = cached_data.get("text", "").strip()
+            if cached_data.get("silent") and full_source:
+                return _silent_segment(segment, cached or segment["text"])
             cached_speed = float(cached_data.get("speed", 1.0))
             if cached:
                 try:
@@ -414,7 +477,9 @@ def fit_narration(project, segment, path, *, full_source=False):
         # Tier 2: gentle TTS speed boost (up to MAX_TTS_SPEED) to fit marginal overshoots naturally
         needed_speed = min(MAX_TTS_SPEED, round(best_error.needed / best_error.available * 1.04, 2))
         speeds = [s for s in dict.fromkeys((needed_speed, MAX_TTS_SPEED)) if s > 1.0]
+        last_speed = 1.0
         for speed in speeds:
+            last_speed = speed
             try:
                 voiced = voice_segment(
                     project, {**segment, "text": best_text},
@@ -432,6 +497,7 @@ def fit_narration(project, segment, path, *, full_source=False):
             words = trimmed.split()
             next_limit = max(1, min(len(words) - 1, floor(len(words) * best_error.available / best_error.needed * 0.88)))
             trimmed = _trim_words(trimmed, next_limit)
+            last_speed = MAX_TTS_SPEED
             try:
                 voiced = voice_segment(
                     project, {**segment, "text": trimmed},
@@ -445,12 +511,55 @@ def fit_narration(project, segment, path, *, full_source=False):
                 return voiced
             except ShortFootage as trim_error:
                 best_error = trim_error
+
+        # Tier 3b: emergency speed boost (up to EMERGENCY_TTS_SPEED) when even a 1-word cue marginally exceeds footage
+        emergency_target = min(
+            EMERGENCY_TTS_SPEED,
+            round(last_speed * best_error.needed / best_error.available * 1.04, 2),
+        )
+        for speed in [s for s in dict.fromkeys((emergency_target, EMERGENCY_TTS_SPEED)) if s > MAX_TTS_SPEED]:
+            try:
+                voiced = voice_segment(
+                    project, {**segment, "text": trimmed},
+                    full_source=full_source, allow_trim_gap=True, speed=speed,
+                )
+                write_json(path, {"text": trimmed, "speed": speed})
+                append_run_log(
+                    project,
+                    f"fit_narration emergency speed={speed:.2f} for {segment['id']} ({len(trimmed.split())} words)",
+                )
+                return voiced
+            except ShortFootage as emergency_error:
+                best_error = emergency_error
+
+        # Tier 4: silent visual bridge fallback for physically un-narratable micro-clips during auto-generation
+        if full_source:
+            write_json(path, {"text": trimmed, "silent": True})
+            append_run_log(
+                project,
+                f"fit_narration silent fallback for {segment['id']} "
+                f"(needed {best_error.needed:.2f}s > available {best_error.available:.2f}s)",
+            )
+            return _silent_segment(segment, trimmed)
         raise best_error
 
 
 def write_selected_timeline(project, job, directory, selection, dialogue, version):
     events = [{**segment, "id": f"event_{segment['segment_id'] + 1:03}"}
               for segment in selection["selected_segments"]]
+    signature = sha256(json.dumps(
+        [(event["segment_id"], event["start"], event["end"]) for event in events],
+        separators=(",", ":"),
+    ).encode()).hexdigest()
+    sig_path = directory / "selection-signature.json"
+    if not sig_path.is_file() or read_json(sig_path).get("signature") != signature:
+        cleared = 0
+        for stale in (*directory.glob("selected-script-*.json"), *directory.glob("selected-rewrite-*.json")):
+            stale.unlink(missing_ok=True)
+            cleared += 1
+        if cleared:
+            append_run_log(project, f"selection changed, cleared {cleared} stale script/rewrite cache files")
+        write_json(sig_path, {"signature": signature, "count": len(events)})
     narration = []
     started = time.monotonic()
     for offset in range(0, len(events), NARRATION_BATCH):

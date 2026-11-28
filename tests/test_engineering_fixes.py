@@ -669,3 +669,144 @@ def test_narrate_selected_uses_fixed_key_schema_and_bisects_on_mismatch(monkeypa
     assert seen_calls == [["1", "2", "3", "4"], ["1", "2"], ["1", "2"]]
     assert len(texts) == 4
     assert all(texts)
+
+
+def test_knapsack_prefers_duration_weighted_value_and_filters_short_fragments():
+    # Budget = 8.0s (8% of 100s). Eight 1.0s fragments @ 0.7 would beat one 8.0s scene @ 0.9 under unweighted score!
+    data = {
+        "video_path": "movie.mp4",
+        "duration": 100.0,
+        "segments": [
+            {"segment_id": i, "start": float(i), "end": float(i + 1), "caption": f"frag {i}", "score": 0.7}
+            for i in range(10)
+        ] + [
+            {"segment_id": 99, "start": 50.0, "end": 58.0, "caption": "Key climax", "score": 0.9},
+        ],
+    }
+    selected = select_segments_knapsack.select_segments(data)
+    assert [s["segment_id"] for s in selected] == [99]
+
+    # Even with min_duration=0.0, duration-weighted value (0.9 * 8 = 7.2 > 0.7 * 8 = 5.6) still picks segment 99
+    selected_no_floor = select_segments_knapsack.select_segments(data, min_duration=0.0)
+    assert [s["segment_id"] for s in selected_no_floor] == [99]
+
+    # Tiny video where all segments are shorter than min_duration falls back cleanly instead of returning empty
+    tiny = {
+        "video_path": "tiny.mp4",
+        "duration": 20.0,
+        "segments": [
+            {"segment_id": 0, "start": 0.0, "end": 1.0, "caption": "only shot", "score": 0.8},
+        ],
+    }
+    assert [s["segment_id"] for s in select_segments_knapsack.select_segments(tiny)] == [0]
+
+
+def test_voice_segment_trims_wav_silence_and_fit_narration_handles_one_word_and_silent_fallback(tmp_path, monkeypatch):
+    import wave
+    from array import array
+
+    project = tmp_path / "proj"
+    (project / "analysis").mkdir(parents=True)
+    (project / "audio").mkdir(parents=True)
+
+    # 1. Real 24kHz mono WAV with 0.15s leading silence + 0.75s speech + 0.20s trailing silence = 1.10s total
+    wav_path = project / "audio" / "padded.wav"
+    pcm = array("h", [0] * 3600 + [5000] * 18_000 + [0] * 4800)
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setparams((1, 2, media.SAMPLE_RATE, 0, "NONE", "not compressed"))
+        wf.writeframes(pcm.tobytes())
+
+    seg_1s = {
+        "id": "segment_001",
+        "text": "Explosion.",
+        "candidates": [{"id": "segment_001-1", "event_id": "event_001", "start": 0.0, "end": 1.0}],
+        "candidate_id": "segment_001-1",
+        "source": {"start": 0.0, "end": 1.0},
+        "event_ids": ["event_001"],
+    }
+    monkeypatch.setattr(
+        pipeline,
+        "speak",
+        lambda proj, text, **kw: [{
+            "text": text, "audio": "padded.wav", "audio_offset": 0,
+            "samples": len(pcm), "gap_after": pipeline.GAP,
+        }],
+    )
+    voiced = pipeline.voice_segment(project, seg_1s, full_source=True, allow_trim_gap=True)
+    assert voiced["cues"][0]["audio_offset"] > 0
+    assert voiced["cues"][0]["samples"] <= media.SAMPLE_RATE
+
+    # 2. One-word cue that still takes 1.10s at MAX_TTS_SPEED (1.25x) on a 1.00s clip -> Tier 3b emergency speed fits
+    seen_speeds = []
+
+    def fake_speak_one_word(proj, text, *, speed=1.0):
+        seen_speeds.append(speed)
+        # 1.10s at 1.25x => 1.375s at 1.0x (33,000 samples)
+        samples = round(33_000 / speed)
+        return [{"text": text, "audio": "missing.wav", "audio_offset": 0, "samples": samples, "gap_after": pipeline.GAP}]
+
+    monkeypatch.setattr(pipeline, "speak", fake_speak_one_word)
+    monkeypatch.setattr(pipeline.model, "shorten", lambda text, dur, avail, *, factor=0.85, max_words=None: text)
+    cache_emerg = project / "analysis" / "rewrite-emerg.json"
+    fitted_emerg = pipeline.fit_narration(project, seg_1s, cache_emerg, full_source=True)
+    assert fitted_emerg["cues"]
+    saved_emerg = store.read_json(cache_emerg)
+    assert pipeline.MAX_TTS_SPEED < saved_emerg["speed"] <= pipeline.EMERGENCY_TTS_SPEED
+
+    # 3. Physically un-narratable 0.50s clip -> Tier 4 silent visual bridge fallback + timeline works cleanly
+    seg_half = {
+        "id": "segment_002",
+        "text": "Run.",
+        "candidates": [{"id": "segment_002-1", "event_id": "event_002", "start": 10.0, "end": 10.5}],
+        "candidate_id": "segment_002-1",
+        "source": {"start": 10.0, "end": 10.5},
+        "event_ids": ["event_002"],
+    }
+    cache_silent = project / "analysis" / "rewrite-silent.json"
+    fitted_silent = pipeline.fit_narration(project, seg_half, cache_silent, full_source=True)
+    assert fitted_silent["cues"] == []
+    assert sum(c["frames"] for c in fitted_silent["clips"]) == 15
+    assert store.read_json(cache_silent)["silent"] is True
+    tl = pipeline.make_timeline([fitted_emerg, fitted_silent], version=1)
+    assert tl["duration"] == pytest.approx(1.5, abs=1e-6)
+
+
+def test_write_selected_timeline_invalidates_stale_script_cache_when_selection_changes(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    directory = project / "analysis" / "recap-1"
+    directory.mkdir(parents=True)
+    (project / "audio").mkdir(parents=True)
+
+    # Pre-populate stale script & rewrite cache without a matching signature
+    store.write_json(directory / "selected-script-0.json", ["stale narration 1", "stale narration 2"])
+    store.write_json(directory / "selected-rewrite-0.json", {"text": "stale rewrite"})
+
+    narrate_calls = []
+
+    def fake_narrate(scenes, previous):
+        narrate_calls.append(len(scenes))
+        return [f"Fresh line {i + 1}." for i in range(len(scenes))]
+
+    monkeypatch.setattr(pipeline.model, "narrate_selected", fake_narrate)
+    monkeypatch.setattr(
+        pipeline,
+        "speak",
+        lambda proj, text, **kw: [{"text": text, "audio": "x.wav", "audio_offset": 0, "samples": 24_000, "gap_after": 0}],
+    )
+
+    selection = {
+        "original_duration": 100.0,
+        "target_ratio": 0.08,
+        "selected_segments": [
+            {"segment_id": 5, "start": 10.0, "end": 14.0, "caption": "Scene A", "score": 0.9},
+        ],
+    }
+    job = {"duration": 100.0}
+    tl1 = pipeline.write_selected_timeline(project, job, directory, selection, [], version=1)
+    assert narrate_calls == [1]
+    assert tl1["segments"][0]["text"] == "Fresh line 1."
+
+    # Running again with identical selection reuses the cache (no second narrate_selected call)
+    tl2 = pipeline.write_selected_timeline(project, job, directory, selection, [], version=1)
+    assert narrate_calls == [1]
+    assert tl2["segments"][0]["text"] == "Fresh line 1."

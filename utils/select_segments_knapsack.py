@@ -4,27 +4,46 @@
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 
 
 RATIO = 0.08
 RESOLUTION = 0.1
+MIN_SEGMENT_DURATION = 2.0
 
 
-def select_segments(captions_score):
-    segments = captions_score["segments"]
-    capacity = captions_score["duration"] * RATIO
-    items = [
-        (math.ceil((segment["end"] - segment["start"]) / RESOLUTION - 1e-9), segment)
-        for segment in segments
+def _min_segment_duration(min_duration=None):
+    if min_duration is not None:
+        return max(0.0, float(min_duration))
+    return max(0.0, float(os.environ.get("RECAP_MIN_SEGMENT_SECONDS", str(MIN_SEGMENT_DURATION))))
+
+
+def select_segments(captions_score, *, min_duration=None):
+    segments = [seg for seg in captions_score["segments"] if seg["end"] - seg["start"] > 0]
+    capacity = math.floor(captions_score["duration"] * RATIO / RESOLUTION + 1e-9)
+
+    def _weight(segment):
+        return math.ceil((segment["end"] - segment["start"]) / RESOLUTION - 1e-9)
+
+    floor_seconds = _min_segment_duration(min_duration)
+    eligible = [
+        seg for seg in segments
+        if seg["end"] - seg["start"] >= floor_seconds and 0 < _weight(seg) <= capacity
     ]
-    capacity = math.floor(capacity / RESOLUTION + 1e-9)
+    if not eligible:
+        eligible = [seg for seg in segments if 0 < _weight(seg) <= capacity]
+
+    items = [
+        (_weight(segment), segment["score"] * (segment["end"] - segment["start"]), segment)
+        for segment in eligible
+    ]
 
     dp = [0.0] * (capacity + 1)
     choices = [bytearray(capacity + 1) for _ in items]
-    for index, (weight, segment) in enumerate(items):
+    for index, (weight, item_value, segment) in enumerate(items):
         for used in range(capacity, weight - 1, -1):
-            value = dp[used - weight] + segment["score"]
+            value = dp[used - weight] + item_value
             if value > dp[used]:
                 dp[used] = value
                 choices[index][used] = 1
@@ -32,7 +51,7 @@ def select_segments(captions_score):
     selected = []
     for index in range(len(items) - 1, -1, -1):
         if choices[index][capacity]:
-            selected.append(items[index][1])
+            selected.append(items[index][2])
             capacity -= items[index][0]
     return sorted(selected, key=lambda segment: segment["start"])
 

@@ -82,6 +82,7 @@ ssh -N -o ExitOnForwardFailure=yes -J <用户>@<登录节点>:<SSH端口> \
 | `RECAP_REPETITION_PENALTY` / `RECAP_FREQUENCY_PENALTY` | `1.1` / `0.2`，画面描述防复读采样惩罚 |
 | `RECAP_SCORE_BATCH_SIZE` | `40`，每次向本地模型请求评分的片段数（保留全片上下文） |
 | `RECAP_SCORE_CONTEXT_CHARS` | `24000`，评分请求附带的全片上下文最大字符数（超限时自动折半降级） |
+| `RECAP_MIN_SEGMENT_SECONDS` | `2.0`，0-1 背包选段时优先保留的最短片段时长（秒），避免选入 1 秒碎片 |
 | `RECAP_CLEANUP_FRAMES` | `0`，设为 `1` 时在全片描述完成后自动清理 `analysis/frames/` |
 | `RECAP_SKIP_PREFLIGHT` | `0`，设为 `1` 时跳过任务进程启动自检 |
 
