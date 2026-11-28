@@ -46,11 +46,15 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8001/v1"
 DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 DEFAULT_BATCH_SIZE = 40
 MIN_BATCH_SIZE = 10
-MAX_CONTEXT_CHARS = 80_000
+MAX_CONTEXT_CHARS = 24_000
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
 
 class ScoreOutputTooLong(RuntimeError):
+    pass
+
+
+class ScoreContextTooLong(RuntimeError):
     pass
 
 
@@ -121,38 +125,86 @@ def _batch_schema(keys):
     }
 
 
-def _format_context(captions):
-    if not captions:
+def _collapse_context_runs(captions):
+    runs = []
+    for item in captions:
+        text = " ".join(item["caption"].split())
+        norm = re.sub(r"^(the scene (shifts|transitions|cuts|moves) to|next,|then,)\s+", "", text.lower())
+        if runs and runs[-1]["norm"] == norm:
+            runs[-1]["end_id"] = item["segment_id"]
+            runs[-1]["end"] = item["end"]
+            runs[-1]["count"] += 1
+        else:
+            runs.append({
+                "start_id": item["segment_id"],
+                "end_id": item["segment_id"],
+                "start": item["start"],
+                "end": item["end"],
+                "count": 1,
+                "text": text,
+                "norm": norm,
+            })
+    return runs
+
+
+def _format_context(captions, max_chars=MAX_CONTEXT_CHARS):
+    if not captions or max_chars <= 0:
         return ""
+    runs = _collapse_context_runs(captions)
     lines = [
-        f"[{c['segment_id']} {c['start']:.1f}-{c['end']:.1f}s] {c['caption'].strip()}"
-        for c in captions
+        (
+            f"[{r['start_id']} {r['start']:.1f}-{r['end']:.1f}s] {r['text']}"
+            if r["count"] == 1
+            else f"[{r['start_id']}..{r['end_id']} {r['start']:.1f}-{r['end']:.1f}s x{r['count']}] {r['text']}"
+        )
+        for r in runs
     ]
     text = "\n".join(lines)
-    if len(text) <= MAX_CONTEXT_CHARS:
+    if len(text) <= max_chars:
         return text
-    budget = max(40, (MAX_CONTEXT_CHARS // len(captions)) - 24)
-    return "\n".join(
-        f"[{c['segment_id']} {c['start']:.1f}-{c['end']:.1f}s] {c['caption'].strip()[:budget]}"
-        for c in captions
-    )
+
+    max_lines = max(1, max_chars // 96)
+    if len(runs) > max_lines:
+        step = len(runs) / max_lines
+        selected = [runs[min(len(runs) - 1, int(i * step))] for i in range(max_lines)]
+    else:
+        selected = runs
+
+    per_line = max(32, max_chars // len(selected) - 1)
+    out = []
+    for r in selected:
+        prefix = (
+            f"[{r['start_id']} {r['start']:.1f}-{r['end']:.1f}s] "
+            if r["count"] == 1
+            else f"[{r['start_id']}..{r['end_id']} {r['start']:.1f}-{r['end']:.1f}s x{r['count']}] "
+        )
+        cap_budget = max(8, per_line - len(prefix))
+        out.append(prefix + r["text"][:cap_budget])
+    return "\n".join(out)[:max_chars]
 
 
 def _format_user_message(context_text, batch, keys, *, full_movie_in_batch):
-    if full_movie_in_batch:
-        return (
-            f"Video caption timeline ({len(batch)} segments):\n{context_text}\n\n"
-            f"Score all {len(batch)} segment_ids ({keys[0]}..{keys[-1]}) as integers 0..100."
-        )
     target_lines = "\n".join(
-        f"[{key} {c['start']:.1f}-{c['end']:.1f}s] {c['caption'].strip()}"
+        f"[{key} {c['start']:.1f}-{c['end']:.1f}s] {' '.join(c['caption'].split())}"
         for key, c in zip(keys, batch)
     )
+    if full_movie_in_batch or not context_text:
+        return (
+            f"Target segments to score ({len(batch)} segments; "
+            f"return ONLY keys {keys[0]}..{keys[-1]}):\n{target_lines}"
+        )
     return (
-        f"Full video caption timeline (for global context):\n{context_text}\n\n"
+        f"Full video caption timeline (compressed global context):\n{context_text}\n\n"
         f"Target segments to score in this batch ({len(batch)} segments; "
         f"return ONLY keys {keys[0]}..{keys[-1]}):\n{target_lines}"
     )
+
+
+def _is_context_length_error(response) -> bool:
+    if response.status_code != 400:
+        return False
+    body = response.text.lower()
+    return "maximum context length" in body or "input_tokens" in body
 
 
 def _score_single_batch(base_url, model, context_text, batch, keys, *, full_movie_in_batch, attempts, backoff):
@@ -190,6 +242,8 @@ def _score_single_batch(base_url, model, context_text, batch, keys, *, full_movi
             raise last_error from error
 
         if response.is_error:
+            if _is_context_length_error(response):
+                raise ScoreContextTooLong(f"模型评分服务 HTTP 400: {response.text[:1000]}")
             last_error = RuntimeError(f"模型评分服务 HTTP {response.status_code}: {response.text[:1000]}")
             if response.status_code in RETRYABLE_STATUS and attempt + 1 < attempts:
                 time.sleep(backoff * (2 ** attempt))
@@ -220,7 +274,7 @@ def _score_single_batch(base_url, model, context_text, batch, keys, *, full_movi
 
 
 # Score captions with the same Qwen model service used for video understanding
-def score(captions, *, batch_size=None, max_retries=None, backoff=1.0):
+def score(captions, *, batch_size=None, context_chars=None, max_retries=None, backoff=1.0):
     if not captions:
         return []
     base_url = os.environ.get("RECAP_MODEL_URL", DEFAULT_BASE_URL).rstrip("/")
@@ -235,12 +289,17 @@ def score(captions, *, batch_size=None, max_retries=None, backoff=1.0):
         if batch_size is None
         else max(1, batch_size)
     )
+    max_context = (
+        max(0, int(os.environ.get("RECAP_SCORE_CONTEXT_CHARS", str(MAX_CONTEXT_CHARS))))
+        if context_chars is None
+        else max(0, context_chars)
+    )
 
     raw_keys = [str(caption.get("segment_id", index)) for index, caption in enumerate(captions)]
     if len(set(raw_keys)) != len(raw_keys):
         raw_keys = [str(index) for index in range(len(captions))]
 
-    context_text = _format_context(captions)
+    context_text = _format_context(captions, max_context)
     scores = []
     pending = [
         (offset, min(offset + chunk_size, len(captions)))
@@ -258,6 +317,18 @@ def score(captions, *, batch_size=None, max_retries=None, backoff=1.0):
                 full_movie_in_batch=(len(batch) == len(captions)),
                 attempts=attempts, backoff=backoff,
             )
+        except ScoreContextTooLong:
+            if max_context > 0:
+                max_context = max_context // 2 if max_context >= 2000 else 0
+                context_text = _format_context(captions, max_context)
+                pending.append((start_idx, end_idx))
+                continue
+            if len(batch) >= MIN_BATCH_SIZE * 2:
+                mid = (start_idx + end_idx) // 2
+                pending.append((mid, end_idx))
+                pending.append((start_idx, mid))
+                continue
+            raise
         except ScoreOutputTooLong:
             if len(batch) < MIN_BATCH_SIZE * 2:
                 raise

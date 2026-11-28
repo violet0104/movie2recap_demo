@@ -78,6 +78,7 @@ ssh -N -o ExitOnForwardFailure=yes -J <用户>@<登录节点>:<SSH端口> \
 | `RECAP_MODEL` | `Qwen/Qwen3-VL-8B-Instruct` |
 | `RECAP_MODEL_MAX_RETRIES` | `3`，本地模型服务请求失败重试次数 |
 | `RECAP_SCORE_BATCH_SIZE` | `40`，每次向本地模型请求评分的片段数（保留全片上下文） |
+| `RECAP_SCORE_CONTEXT_CHARS` | `24000`，评分请求附带的全片上下文最大字符数（超限时自动折半降级） |
 | `RECAP_CLEANUP_FRAMES` | `0`，设为 `1` 时在全片描述完成后自动清理 `analysis/frames/` |
 | `RECAP_SKIP_PREFLIGHT` | `0`，设为 `1` 时跳过任务进程启动自检 |
 

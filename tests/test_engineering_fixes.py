@@ -108,6 +108,49 @@ def test_score_caption_batches_and_bisects_on_length(monkeypatch):
     assert scored[44]["score"] == 0.88
 
 
+def test_score_caption_strict_context_cap_for_2500_segments_and_400_fallback(monkeypatch):
+    # 2,500 segments (longer than Avatar Extended) must strictly stay within context_chars
+    many_captions = [
+        {"segment_id": i, "start": float(i * 4), "end": float(i * 4 + 4),
+         "caption": f"Distinct event {i}: a character moves across the forest and reacts to a sudden threat."}
+        for i in range(2500)
+    ]
+    ctx = score_caption._format_context(many_captions, max_chars=24_000)
+    assert len(ctx) <= 24_000
+
+    # Consecutive duplicate segments collapse cleanly in overview context
+    dup_captions = [
+        {"segment_id": i, "start": float(i * 2), "end": float(i * 2 + 2),
+         "caption": ("The scene shifts to a room." if i % 2 == 0 else "The scene transitions to a room.")}
+        for i in range(200)
+    ]
+    dup_ctx = score_caption._format_context(dup_captions, max_chars=24_000)
+    assert "x200" in dup_ctx
+    assert len(dup_ctx) < 200
+
+    # Simulate vLLM HTTP 400 maximum context length -> score() halves context and succeeds
+    seen_prompt_lens = []
+
+    def fake_post(url, *, json, timeout, trust_env):
+        user_msg = json["messages"][1]["content"]
+        seen_prompt_lens.append(len(user_msg))
+        if len(user_msg) > 5000:
+            return _make_response(400, '{"error":{"message":"This model\'s maximum context length is 65536 tokens. (parameter=input_tokens)"}}')
+        keys = json["response_format"]["json_schema"]["schema"]["required"]
+        return _make_response(200, {"choices": [{
+            "finish_reason": "stop",
+            "message": {"content": json_lib.dumps({k: 50 for k in keys})},
+        }]})
+
+    json_lib = json
+    monkeypatch.setattr(score_caption.httpx, "post", fake_post)
+    sample = many_captions[:60]
+    scored = score_caption.score(sample, batch_size=30, context_chars=8000, max_retries=2, backoff=0.0)
+    assert len(scored) == 60
+    assert seen_prompt_lens[0] > 5000
+    assert seen_prompt_lens[1] < seen_prompt_lens[0]
+
+
 def test_score_caption_does_not_retry_400(monkeypatch):
     count = 0
 
