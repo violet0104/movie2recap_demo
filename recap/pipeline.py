@@ -19,7 +19,8 @@ CAPTION_FRAMES = 300
 MIN_CAPTION_FRAMES = 15
 NARRATION_BATCH = 12
 GAP = round(0.16 * SAMPLE_RATE)
-SHORTEN_FACTORS = (0.9, 0.8, 0.7)
+SHORTEN_FACTORS = (0.85, 0.72, 0.58)
+MAX_TTS_SPEED = 1.25
 
 
 def progress(project, job, stage, done=None, total=None, **details):
@@ -146,8 +147,9 @@ def caption_groups(tokens):
         yield group
 
 
-def speak(project, text):
-    key = sha256(f"af_heart:paragraph-v1\n{text}".encode()).hexdigest()
+def speak(project, text, *, speed=1.0):
+    prefix = "af_heart:paragraph-v1" if speed == 1.0 else f"af_heart:paragraph-v1:speed={speed:.2f}"
+    key = sha256(f"{prefix}\n{text}".encode()).hexdigest()
     path = project / "audio" / f"{key}.wav"
     index = path.with_suffix(".json")
     if path.is_file() and index.is_file():
@@ -158,7 +160,7 @@ def speak(project, text):
     temporary = path.with_suffix(".wav.tmp")
     with wave.open(str(temporary), "wb") as output:
         output.setparams((1, 2, SAMPLE_RATE, 0, "NONE", "not compressed"))
-        for result in kokoro()(text, voice="af_heart", split_pattern=None):
+        for result in kokoro()(text, voice="af_heart", speed=speed, split_pattern=None):
             audio = result.audio
             if audio is None or not audio.numel():
                 continue
@@ -211,8 +213,9 @@ class ShortFootage(ValueError):
         super().__init__(f"旁白需要 {needed:.2f} 秒，可用画面 {available:.2f} 秒。请缩短旁白或扩大剪辑区间。")
 
 
-def voice_segment(project, segment, *, full_source=False, allow_trim_gap=False):
-    cues = [dict(cue) for cue in speak(project, segment["text"])]
+def voice_segment(project, segment, *, full_source=False, allow_trim_gap=False, speed=1.0):
+    raw_cues = speak(project, segment["text"]) if speed == 1.0 else speak(project, segment["text"], speed=speed)
+    cues = [dict(cue) for cue in raw_cues]
     required = ceil(sum(cue["samples"] + cue["gap_after"] for cue in cues) / SAMPLES_PER_FRAME)
     selected = next(shot for shot in segment["candidates"] if shot["id"] == segment["candidate_id"])
     if segment.get("use_all_candidates"):
@@ -227,9 +230,7 @@ def voice_segment(project, segment, *, full_source=False, allow_trim_gap=False):
     total_capacity = sum(capacities)
     if total_capacity < required and allow_trim_gap and cues and cues[-1].get("gap_after", 0) > 0:
         cues[-1]["gap_after"] = 0
-        trimmed = ceil(sum(cue["samples"] + cue["gap_after"] for cue in cues) / SAMPLES_PER_FRAME)
-        if trimmed <= total_capacity:
-            required = trimmed
+        required = ceil(sum(cue["samples"] + cue["gap_after"] for cue in cues) / SAMPLES_PER_FRAME)
     if total_capacity < required:
         raise ShortFootage(required / FPS, total_capacity / FPS)
     if full_source:
@@ -290,29 +291,49 @@ def script_segments(script, events, prefix="segment"):
     return segments
 
 
+def _trim_words(text, limit):
+    words = text.split()[:max(1, limit)]
+    while len(words) > 1 and words[-1].rstrip(",;:").lower() in {"a", "an", "the", "and", "or", "but", "to", "of", "in", "on", "with", "for"}:
+        words.pop()
+    trimmed = " ".join(words).rstrip(",;:- ")
+    if trimmed and trimmed[-1] not in ".!?":
+        trimmed += "."
+    return trimmed
+
+
 def fit_narration(project, segment, path, *, full_source=False):
     try:
         return voice_segment(project, segment, full_source=full_source, allow_trim_gap=True)
     except ShortFootage as error:
-        current_text = segment["text"]
-        current_error = error
+        best_text = segment["text"]
+        best_error = error
         if path.is_file():
-            cached = read_json(path).get("text", "").strip()
+            cached_data = read_json(path)
+            cached = cached_data.get("text", "").strip()
+            cached_speed = float(cached_data.get("speed", 1.0))
             if cached:
                 try:
-                    return voice_segment(project, {**segment, "text": cached}, full_source=full_source, allow_trim_gap=True)
+                    return voice_segment(
+                        project, {**segment, "text": cached},
+                        full_source=full_source, allow_trim_gap=True, speed=cached_speed,
+                    )
                 except ShortFootage as cached_error:
                     append_run_log(
                         project,
                         f"rewrite cache stale for {segment['id']}: "
                         f"needed {cached_error.needed:.2f}s > available {cached_error.available:.2f}s",
                     )
-                    if len(cached.split()) <= len(current_text.split()):
-                        current_text = cached
-                        current_error = cached_error
+                    if cached_error.needed < best_error.needed:
+                        best_text = cached
+                        best_error = cached_error
+
+        word_cap = None
         for round_index, factor in enumerate(SHORTEN_FACTORS, 1):
+            current_words = max(1, len(best_text.split()))
+            computed_cap = max(1, int(current_words * best_error.available / best_error.needed * factor))
+            word_cap = computed_cap if word_cap is None else max(1, min(computed_cap, word_cap - 1))
             shortened = model.shorten(
-                current_text, current_error.needed, current_error.available, factor=factor,
+                best_text, best_error.needed, best_error.available, factor=factor, max_words=word_cap,
             ).strip()
             if not shortened:
                 continue
@@ -327,9 +348,45 @@ def fit_narration(project, segment, path, *, full_source=False):
                     f"shorten round {round_index} for {segment['id']} still long: "
                     f"{next_error.needed:.2f}s > {next_error.available:.2f}s",
                 )
-                current_text = shortened
-                current_error = next_error
-        raise current_error
+                if next_error.needed < best_error.needed:
+                    best_text = shortened
+                    best_error = next_error
+
+        # Tier 2: gentle TTS speed boost (up to MAX_TTS_SPEED) to fit marginal overshoots naturally
+        needed_speed = min(MAX_TTS_SPEED, round(best_error.needed / best_error.available * 1.04, 2))
+        speeds = [s for s in dict.fromkeys((needed_speed, MAX_TTS_SPEED)) if s > 1.0]
+        for speed in speeds:
+            try:
+                voiced = voice_segment(
+                    project, {**segment, "text": best_text},
+                    full_source=full_source, allow_trim_gap=True, speed=speed,
+                )
+                write_json(path, {"text": best_text, "speed": speed})
+                append_run_log(project, f"fit_narration speed={speed:.2f} for {segment['id']}")
+                return voiced
+            except ShortFootage as speed_error:
+                best_error = speed_error
+
+        # Tier 3: deterministic word-trim fallback so automatic generation never aborts on one stubborn clip
+        trimmed = best_text
+        while len(trimmed.split()) > 1:
+            words = trimmed.split()
+            next_limit = max(1, min(len(words) - 1, floor(len(words) * best_error.available / best_error.needed * 0.88)))
+            trimmed = _trim_words(trimmed, next_limit)
+            try:
+                voiced = voice_segment(
+                    project, {**segment, "text": trimmed},
+                    full_source=full_source, allow_trim_gap=True, speed=MAX_TTS_SPEED,
+                )
+                write_json(path, {"text": trimmed, "speed": MAX_TTS_SPEED})
+                append_run_log(
+                    project,
+                    f"fit_narration trimmed fallback for {segment['id']} ({len(trimmed.split())} words, speed={MAX_TTS_SPEED:.2f})",
+                )
+                return voiced
+            except ShortFootage as trim_error:
+                best_error = trim_error
+        raise best_error
 
 
 def write_selected_timeline(project, job, directory, selection, dialogue, version):
@@ -346,7 +403,7 @@ def write_selected_timeline(project, job, directory, selection, dialogue, versio
             scenes = [{
                 "caption": event["caption"],
                 "dialogue": [cue["text"] for cue in window_dialogue(dialogue, event["start"], event["end"])],
-                "max_words": max(1, floor((event["end"] - event["start"] - 0.25) * 2.3)),
+                "max_words": max(1, floor((event["end"] - event["start"] - 0.25) * 2.1)),
             } for event in events[offset:offset + NARRATION_BATCH]]
             texts = model.narrate_selected(scenes, narration[-2:])
             write_json(path, texts)

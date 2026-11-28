@@ -242,15 +242,62 @@ def test_voice_segment_trims_gap_and_fit_narration_recovers_stale_cache(tmp_path
     shorten_factors = []
     shorten_outputs = ["round1 text", "round2 ok"]
 
-    def fake_shorten(text, duration, available, *, factor=0.9):
+    def fake_shorten(text, duration, available, *, factor=0.85, max_words=None):
         shorten_factors.append(factor)
         return shorten_outputs.pop(0)
 
     monkeypatch.setattr(pipeline.model, "shorten", fake_shorten)
     fitted = pipeline.fit_narration(project, segment, cache_path, full_source=True)
     assert fitted["text"] == "round2 ok"
-    assert shorten_factors == [0.9, 0.8]
+    assert shorten_factors == [0.85, 0.72]
     assert store.read_json(cache_path) == {"text": "round2 ok"}
+
+
+def test_fit_narration_speed_boost_and_deterministic_trim_fallback(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    (project / "analysis").mkdir(parents=True)
+    (project / "audio").mkdir(parents=True)
+
+    # 4.00s clip (120 frames = 96,000 samples)
+    segment = {
+        "id": "segment_002",
+        "text": "The hero runs across the dark bridge to escape the guards.",
+        "candidates": [{"id": "segment_002-1", "event_id": "event_002", "start": 0.0, "end": 4.0}],
+        "candidate_id": "segment_002-1",
+        "source": {"start": 0.0, "end": 4.0},
+        "event_ids": ["event_002"],
+    }
+
+    # Case A: model.shorten fails to shrink below 4.77s, but Kokoro speed boost (~1.24x) fits 4.00s naturally
+    seen_speeds = []
+
+    def fake_speak_speed(proj, text, *, speed=1.0):
+        seen_speeds.append(speed)
+        # 4.77s at speed=1.0 -> 114,480 samples; scales inversely with speed
+        samples = round(114_480 / speed)
+        return [{"text": text, "audio": "a.wav", "audio_offset": 0, "samples": samples, "gap_after": pipeline.GAP}]
+
+    monkeypatch.setattr(pipeline, "speak", fake_speak_speed)
+    monkeypatch.setattr(pipeline.model, "shorten", lambda text, dur, avail, *, factor=0.85, max_words=None: text)
+
+    cache_a = project / "analysis" / "rewrite-a.json"
+    fitted = pipeline.fit_narration(project, segment, cache_a, full_source=True)
+    assert fitted["text"] == segment["text"]
+    assert any(s > 1.0 for s in seen_speeds)
+    saved_a = store.read_json(cache_a)
+    assert 1.0 < saved_a["speed"] <= pipeline.MAX_TTS_SPEED
+
+    # Case B: even at MAX_TTS_SPEED (1.25x), 11 words take too long (0.6s/word -> 5.28s > 4.0s); deterministic trim succeeds
+    def fake_speak_word_based(proj, text, *, speed=1.0):
+        samples = round(len(text.split()) * 14_400 / speed)  # 0.6s per word at 1.0x
+        return [{"text": text, "audio": "a.wav", "audio_offset": 0, "samples": samples, "gap_after": pipeline.GAP}]
+
+    monkeypatch.setattr(pipeline, "speak", fake_speak_word_based)
+    cache_b = project / "analysis" / "rewrite-b.json"
+    fitted_b = pipeline.fit_narration(project, segment, cache_b, full_source=True)
+    assert len(fitted_b["text"].split()) < len(segment["text"].split())
+    assert fitted_b["text"].endswith(".")
+    assert store.read_json(cache_b)["speed"] == pipeline.MAX_TTS_SPEED
 
 
 def test_store_write_json_concurrent_atomic(tmp_path):
