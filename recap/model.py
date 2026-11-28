@@ -205,10 +205,13 @@ def narrate_selected(segments, earlier):
         return _parse_narration_batch(raw, keys)
 
 
-def shorten(text, duration, available, *, factor=0.9):
+def shorten(text, duration, available, *, factor=0.85, max_words=None):
+    current_words = max(1, len(text.split()))
+    computed = max(1, int(current_words * available / duration * factor))
+    target_words = computed if max_words is None else max(1, min(computed, max_words))
     return ask(Narration, (
-        "Shorten this English narration while keeping the main action and result. "
-        "Keep the conversational delivery and the connection to the next action. "
-        "Return only the revised narration in text. Stay within the target word count."
-    ), {"text": text, "target_words": max(1, int(len(text.split()) * available / duration * factor))},
+        "Rewrite this English narration to be strictly shorter while keeping only the main action and outcome. "
+        "Use one concise spoken sentence. Do NOT exceed target_words words. "
+        "Return only the revised narration in text."
+    ), {"text": text, "current_words": current_words, "target_words": target_words},
         max_tokens=512).text
