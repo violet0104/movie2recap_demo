@@ -114,7 +114,7 @@ def caption_batch(frames, duration, start, end, dialogue):
         "the part visible here. Use two short English sentences for a brief event and up to three "
         "for a longer event. Describe the actions and visible consequences. Use descriptive labels "
         "such as 'a soldier' for people; identifying characters by name is unnecessary. "
-        "Use the matching dialogue only as context. Give each event absolute start and end seconds "
+        "Use the matching dialogue only as context when provided. Give each event absolute start and end seconds "
         "within the batch, with non-overlapping intervals and exclusive end times."
     ), {
         "window_start": start, "window_end": end, "frame_count": len(frames),
@@ -126,7 +126,7 @@ def narrate_selected(segments, earlier):
     result = ask(NarrationBatch, (
         "Write a continuous English movie recap for these selected scenes in input order. "
         "Return exactly one spoken paragraph for each scene. Describe the action and its consequence, "
-        "and use the previous narration for continuity. Use the caption and timed dialogue as evidence. "
+        "and use the previous narration for continuity. Use the caption and any provided timed dialogue as evidence. "
         "Use a name only when the evidence supports it. Stay within each scene's word limit "
         "so the narration fits the selected footage."
     ), {"scenes": segments, "previous_narration": earlier}, max_tokens=2400)

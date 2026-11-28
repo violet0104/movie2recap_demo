@@ -44,21 +44,19 @@ def test_knapsack_cli_main_runs_without_name_error(tmp_path):
     assert [s["segment_id"] for s in saved["selected_segments"]] == [1, 2]
 
 
-def test_score_caption_env_retries_fence_and_clamping(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
-    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://custom.deepseek.local/v1/")
-    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-chat")
-    monkeypatch.setenv("DEEPSEEK_THINKING", "0")
+def test_score_caption_uses_qwen_env_retries_fence_and_clamping(monkeypatch):
+    monkeypatch.setenv("RECAP_MODEL_URL", "http://127.0.0.1:9001/v1/")
+    monkeypatch.setenv("RECAP_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
 
     calls = []
     responses = [
         _make_response(429, "rate limited"),
-        _make_response(200, {"choices": [{"message": {"content": '{"scores": [0.5]}'}}]}),
-        _make_response(200, {"choices": [{"message": {"content": '```json\n{"scores": [-0.2, 1.456]}\n```'}}]}),
+        _make_response(200, {"choices": [{"finish_reason": "stop", "message": {"content": '{"scores": [0.5]}'}}]}),
+        _make_response(200, {"choices": [{"finish_reason": "stop", "message": {"content": '```json\n{"scores": [-0.2, 1.456]}\n```'}}]}),
     ]
 
-    def fake_post(url, *, headers, json, timeout):
-        calls.append((url, headers, json))
+    def fake_post(url, *, json, timeout, trust_env):
+        calls.append((url, json, trust_env))
         return responses.pop(0)
 
     monkeypatch.setattr(score_caption.httpx, "post", fake_post)
@@ -70,24 +68,23 @@ def test_score_caption_env_retries_fence_and_clamping(monkeypatch):
     ]
     scored = score_caption.score(captions, max_retries=3, backoff=0.0)
     assert len(calls) == 3
-    assert calls[0][0] == "https://custom.deepseek.local/v1/chat/completions"
-    assert calls[0][2]["model"] == "deepseek-chat"
-    assert "thinking" not in calls[0][2]
-    assert "reasoning_effort" not in calls[0][2]
+    assert calls[0][0] == "http://127.0.0.1:9001/v1/chat/completions"
+    assert calls[0][1]["model"] == "Qwen/Qwen3-VL-8B-Instruct"
+    assert calls[0][1]["response_format"]["type"] == "json_schema"
+    assert calls[0][2] is False
     assert [item["score"] for item in scored] == [0.0, 1.0]
 
 
-def test_score_caption_does_not_retry_401(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "bad-key")
+def test_score_caption_does_not_retry_400(monkeypatch):
     count = 0
 
     def fake_post(*args, **kwargs):
         nonlocal count
         count += 1
-        return _make_response(401, "unauthorized")
+        return _make_response(400, "bad request")
 
     monkeypatch.setattr(score_caption.httpx, "post", fake_post)
-    with pytest.raises(RuntimeError, match="DeepSeek HTTP 401"):
+    with pytest.raises(RuntimeError, match="HTTP 400"):
         score_caption.score([{"segment_id": 0, "start": 0.0, "end": 1.0, "caption": "x"}], max_retries=3, backoff=0.0)
     assert count == 1
 
@@ -238,7 +235,6 @@ def test_api_subtitles_encoding_size_preview_dedup_delete_and_health(tmp_path, m
     monkeypatch.setattr(store, "PROJECTS", projects_dir)
     monkeypatch.setattr(api, "PROJECTS", projects_dir)
     monkeypatch.setattr(api.model, "check_model_server", lambda timeout=2.0: {"ok": True, "url": "http://127.0.0.1:8001/v1", "models": ["m"], "target_present": True})
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
 
     client = TestClient(api.app)
 
@@ -246,9 +242,9 @@ def test_api_subtitles_encoding_size_preview_dedup_delete_and_health(tmp_path, m
     res = client.get("/api/health")
     assert res.status_code == 200
     body = res.json()
-    assert body["deepseek_key_configured"] is True
     assert body["vllm"]["ok"] is True
     assert body["worker_running"] is False
+    assert "deepseek_key_configured" not in body
 
     # Create project
     pid = client.post("/api/projects").json()["id"]
@@ -321,12 +317,16 @@ def test_api_subtitles_encoding_size_preview_dedup_delete_and_health(tmp_path, m
     assert not proj.exists()
 
 
-def test_worker_preflight_catches_missing_deepseek_key(monkeypatch):
+def test_worker_preflight_checks_vllm_without_deepseek_key(monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.setattr(worker, "check_media_tools", lambda: {"ok": True, "errors": [], "warnings": []})
-    monkeypatch.setattr(worker.model, "check_model_server", lambda timeout=5.0: {"ok": True, "url": "u", "models": [], "target_present": True})
     monkeypatch.setattr(worker, "kokoro", lambda: object())
-    with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
+
+    monkeypatch.setattr(worker.model, "check_model_server", lambda timeout=5.0: {"ok": True, "url": "u", "models": [], "target_present": True})
+    worker.preflight()
+
+    monkeypatch.setattr(worker.model, "check_model_server", lambda timeout=5.0: {"ok": False, "url": "u", "error": "down"})
+    with pytest.raises(RuntimeError, match="模型服务不可达"):
         worker.preflight()
 
 
@@ -389,3 +389,48 @@ def test_worker_run_writes_run_log_and_pipeline_edit_enforces_budget(tmp_path, m
     assert store.read_json(proj / "timeline.json")["duration"] == pytest.approx(7.0)
     run_log = (proj / "analysis" / "run.log").read_text(encoding="utf-8")
     assert "task edit finished" in run_log
+
+
+def test_generate_works_without_subtitles_and_without_offset(tmp_path, monkeypatch):
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    monkeypatch.setattr(store, "PROJECTS", projects_dir)
+    monkeypatch.setattr(api, "PROJECTS", projects_dir)
+
+    client = TestClient(api.app)
+    pid = client.post("/api/projects").json()["id"]
+
+    # Cannot generate before movie upload completes
+    assert client.post(f"/api/projects/{pid}/generate").status_code == 409
+
+    # Upload movie only (no subtitles)
+    res = client.put(f"/api/projects/{pid}/movie?name=clip.mp4&offset=0&total=8", content=b"12345678")
+    assert res.status_code == 200
+    assert res.json()["complete"] is True
+
+    # Generate succeeds without subtitles and without subtitle_offset
+    gen = client.post(f"/api/projects/{pid}/generate")
+    assert gen.status_code == 202
+    assert gen.json()["status"] == "queued"
+    assert gen.json()["subtitles"] is None
+
+    # pipeline.generate passes empty dialogue list when dialogue.srt is absent
+    proj = projects_dir / pid
+    job = store.read_json(proj / "job.json")
+    seen_dialogue = []
+
+    monkeypatch.setattr(pipeline, "probe", lambda movie: {"duration": 100.0, "width": 1280, "height": 720})
+
+    def fake_caption_movie(project, job_arg, movie, dialogue):
+        seen_dialogue.append(dialogue)
+        cap_path = project / "analysis" / "caption.json"
+        store.write_json(cap_path, {"segments": []})
+        return cap_path
+
+    monkeypatch.setattr(pipeline, "caption_movie", fake_caption_movie)
+    monkeypatch.setattr(pipeline, "select_captions", lambda p, j, c: {"selected_segments": []})
+    monkeypatch.setattr(pipeline, "write_selected_timeline", lambda p, j, d, s, dlg, v: {"version": v, "dialogue_len": len(dlg)})
+
+    out = pipeline.generate(proj, job, proj / "source" / "movie.mp4", 1)
+    assert seen_dialogue == [[]]
+    assert out["dialogue_len"] == 0

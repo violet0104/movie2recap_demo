@@ -1,6 +1,6 @@
 # 电影解说 Demo 技术方案
 
-用户在远程服务器的浏览器打开 Demo，上传一部电影和对应的 SRT 字幕。页面显示生成进度，并提供在线审片、修改和下载。系统为每部电影生成新的英文解说，自动选段的总时长上限为原片的 **8%**。交付物是带英文字幕的 **720p MP4** 和独立的 **SRT**。
+用户在远程服务器的浏览器打开 Demo，上传一部电影（可选上传对应的 SRT 字幕）。页面显示生成进度，并提供在线审片、修改和下载。系统为每部电影生成新的英文解说，自动选段的总时长上限为原片的 **8%**。交付物是带英文字幕的 **720p MP4** 和独立的 **SRT**。
 
 `avatar-recap.mp4` 用作剪辑节奏和画面呈现的参考。旁白由 Kokoro 使用固定的预设英文音色生成。剧情分析模型和处理程序运行在同一台远程 Linux GPU 服务器上。Demo 采用单用户、单任务进程和项目目录存储。
 
@@ -11,7 +11,7 @@
 | 网页 | React、TypeScript、Vite | 上传、查看进度、在线播放、逐段编辑和下载。 |
 | Web 服务 | Python、FastAPI | 提供打包后的网页和 API，管理项目文件和任务状态，提供视频播放接口。 |
 | 任务进程 | Python、FFmpeg、ffprobe、Kokoro | 按固定规则抽帧和组窗，调用模型服务并保存结果，生成旁白和成片。 |
-| 模型服务 | Qwen3-VL-8B-Instruct、vLLM、DeepSeek | Qwen 描述画面并写旁白，DeepSeek 根据全片描述给每个片段评分。 |
+| 模型服务 | Qwen3-VL-8B-Instruct、vLLM | Qwen 描述画面、根据全片描述给每个片段评分并写旁白。 |
 | 存储 | 服务器磁盘、JSON | 保存上传素材、分析结果、时间线、配音和导出文件。 |
 | 运行环境 | Linux、NVIDIA GPU、uv | 用普通用户权限安装 Python 环境，在服务器上启动 Web 服务、任务进程和模型服务。 |
 
@@ -20,8 +20,7 @@
 ```text
 服务器浏览器 ↔ FastAPI ↔ 项目目录
 任务进程 ↔ 项目目录
-任务进程 → vLLM / Qwen3-VL
-任务进程 → DeepSeek API（片段描述和时间码）
+任务进程 → vLLM / Qwen3-VL（画面描述、全片评分与旁白撰写）
 任务进程 → Kokoro / FFmpeg
 ```
 
@@ -31,7 +30,7 @@
 
 - **大文件上传。** 浏览器分块发送电影。API 返回服务器已提交的字节数。连接中断后，浏览器从该偏移继续上传。服务端写完分块后推进偏移，全部上传完成后发布原片文件。
 - **读取视频信息。** 用 `ffprobe` 读取原片时长、分辨率和轨道信息，供分窗和渲染使用。
-- **解析字幕。** 从 SRT 读取字幕编号、起止时间和文本。用户可以设置全局字幕偏移。窗口匹配使用偏移后的字幕时间。
+- **解析字幕（可选）。** 如果用户上传了 SRT，则从中读取字幕编号、起止时间和文本用于窗口匹配；未上传字幕时仅基于画面帧进行分析。
 
 ## 3. 分批生成事件描述
 
@@ -41,7 +40,7 @@ FFmpeg 按每秒一帧生成分析帧。Qwen3-VL 每次读取 300 帧和同一�
 
 ## 4. 评分和选段
 
-任务进程调用 `utils/score_caption.py` 读入全部片段描述，让 DeepSeek 参考全片内容为每段评分，并保存 `analysis/caption_score.json`。评分请求发送文本和时间码。任务进程通过 `DEEPSEEK_API_KEY` 认证。[DeepSeek Chat Completions 文档](https://api-docs.deepseek.com/api/create-chat-completion/)
+任务进程调用 `utils/score_caption.py` 读入全部片段描述，复用本地 `Qwen3-VL` 模型服务（`RECAP_MODEL_URL` / `RECAP_MODEL`）参考全片内容为每段评分，并保存 `analysis/caption_score.json`。评分请求发送文本和时间码，并使用 JSON Schema 约束输出格式。
 
 `utils/select_segments_knapsack.py` 以原片时长的 8% 为预算，在预算内最大化所选片段的总分，并按起点排序，保存为 `analysis/selected_segments.json`。Qwen 结合选中片段的描述和对白撰写连续的英文旁白，每个片段对应一段旁白。网页保留原片入点和出点，供审看和编辑。
 
@@ -55,7 +54,7 @@ FFmpeg 按每秒一帧生成分析帧。Qwen3-VL 每次读取 300 帧和同一�
 
 ## 6. 网页操作和在线播放
 
-- **上传页**接收电影和 SRT，显示上传进度和字幕偏移。用户确认素材后启动生成。
+- **上传页**接收电影和可选 SRT，显示上传进度。用户确认素材后启动生成。
 - **进度页**显示当前阶段、已读取的原片位置和已提取事件数。网页定期读取任务状态。刷新页面后可继续查看同一项目。
 - **项目页**使用浏览器原生视频播放器。已经生成的解说可以直接播放、暂停、拖动进度条和全屏。英文字幕随画面显示。播放器旁边显示各段旁白、原片时间和成片位置。
 - **编辑**支持更换候选镜头、调整入点和出点、修改英文旁白。改稿后重新合成该段语音，并更新后续时间码。页面显示预览对应的时间线版本，用户可以从当前版本重新生成预览或导出。
@@ -68,8 +67,8 @@ FFmpeg 按每秒一帧生成分析帧。Qwen3-VL 每次读取 300 帧和同一�
 | `POST /api/projects` | 创建项目，返回项目 ID。 |
 | `GET /api/projects/{id}/upload` | 查询原片上传偏移。 |
 | `PUT /api/projects/{id}/movie` | 上传一个分块，携带偏移和文件总长度。 |
-| `PUT /api/projects/{id}/subtitles` | 上传 SRT。 |
-| `POST /api/projects/{id}/generate` | 按字幕偏移和 8% 选段预算启动生成。 |
+| `PUT /api/projects/{id}/subtitles` | 上传可选 SRT。 |
+| `POST /api/projects/{id}/generate` | 按 8% 选段预算启动生成。 |
 | `GET /api/projects/{id}` | 获取任务状态、进度和可播放产物。 |
 | `GET /api/projects/{id}/timeline` | 读取英文稿、剪辑区间和成片时间。 |
 | `PATCH /api/projects/{id}/timeline` | 保存段落修改并生成新的时间线版本。 |

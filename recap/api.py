@@ -1,4 +1,3 @@
-import os
 import shutil
 import threading
 from pathlib import Path
@@ -28,10 +27,6 @@ def _clip_lock(key: str) -> threading.Lock:
         if mutex is None:
             mutex = _clip_locks[key] = threading.Lock()
         return mutex
-
-
-class Generate(BaseModel):
-    subtitle_offset: float = Field(default=0, allow_inf_nan=False)
 
 
 class Edit(BaseModel):
@@ -169,14 +164,14 @@ async def put_subtitles(project_id: UUID, name: str, request: Request):
 
 
 @app.post("/api/projects/{project_id}/generate", status_code=202)
-def generate(project_id: UUID, settings: Generate):
+def generate(project_id: UUID):
     project = project_path(project_id)
     with lock(project / ".lock"):
         job = upload_job(project)
         upload = current_upload(project, job)
-        if not upload or not upload["complete"] or not job["subtitles"]:
-            raise HTTPException(409, "请上传原片和字幕")
-        job["settings"] = settings.model_dump()
+        if not upload or not upload["complete"]:
+            raise HTTPException(409, "请先上传原片")
+        job["settings"] = {}
         enqueue(project, job, {"kind": "generate"})
     return job
 
@@ -283,13 +278,11 @@ def delete_project(project_id: UUID):
 def health():
     vllm = model.check_model_server(timeout=2.0)
     worker_running = worker_alive()
-    deepseek_configured = bool(os.environ.get("DEEPSEEK_API_KEY"))
-    ok = worker_running and vllm["ok"] and deepseek_configured
+    ok = worker_running and vllm["ok"]
     return {
         "status": "ok" if ok else "degraded",
         "worker_running": worker_running,
         "vllm": vllm,
-        "deepseek_key_configured": deepseek_configured,
     }
 
 

@@ -1,6 +1,6 @@
 # Movie2Recap
 
-在 Linux GPU 服务器上运行的单用户电影解说 Demo。上传 MP4 或 MKV 原片和 UTF-8 SRT 对白字幕，生成带英文旁白和烧录字幕的 720p MP4，并下载独立 SRT。自动选段的总时长上限为原片的 8%。技术方案见 [TECHNICAL_PLAN.md](TECHNICAL_PLAN.md)。
+在 Linux GPU 服务器上运行的单用户电影解说 Demo。上传 MP4 或 MKV 原片（可选上传 UTF-8 SRT 对白字幕），生成带英文旁白和烧录字幕的 720p MP4，并下载独立 SRT。自动选段的总时长上限为原片的 8%。技术方案见 [TECHNICAL_PLAN.md](TECHNICAL_PLAN.md)。
 
 ## 安装
 
@@ -47,7 +47,7 @@ PATH="$PWD/.vllm/bin:$PATH" .vllm/bin/vllm serve models/Qwen3-VL-8B-Instruct \
 .venv/bin/python -m uvicorn recap.api:app --host 127.0.0.1 --port 8080
 ```
 
-在任务进程的环境中设置 `DEEPSEEK_API_KEY`。模型服务就绪后启动任务进程：
+模型服务就绪后启动任务进程：
 
 ```bash
 HF_HUB_OFFLINE=1 .venv/bin/python -m recap.worker
@@ -74,16 +74,11 @@ ssh -N -o ExitOnForwardFailure=yes -J <用户>@<登录节点>:<SSH端口> \
 | --- | --- |
 | `RECAP_DATA_DIR` | 项目根目录下的 `data` |
 | `RECAP_FFMPEG` / `RECAP_FFPROBE` | `ffmpeg` / `ffprobe` |
-| `RECAP_MODEL_URL` | `http://127.0.0.1:8001/v1` |
+| `RECAP_MODEL_URL` | `http://127.0.0.1:8001/v1`（用于画面描述、片段评分与旁白撰写） |
 | `RECAP_MODEL` | `Qwen/Qwen3-VL-8B-Instruct` |
 | `RECAP_MODEL_MAX_RETRIES` | `3`，本地模型服务请求失败重试次数 |
 | `RECAP_CLEANUP_FRAMES` | `0`，设为 `1` 时在全片描述完成后自动清理 `analysis/frames/` |
 | `RECAP_SKIP_PREFLIGHT` | `0`，设为 `1` 时跳过任务进程启动自检 |
-| `DEEPSEEK_API_KEY` | 由部署环境提供，用于发送分段描述和时间码进行评分 |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` |
-| `DEEPSEEK_MODEL` | `deepseek-flash` |
-| `DEEPSEEK_THINKING` / `DEEPSEEK_REASONING_EFFORT` | `1` / `high`，设为 `0` 可关闭 thinking 参数 |
-| `DEEPSEEK_MAX_RETRIES` | `3`，评分请求重试次数 |
 
 可通过 `GET /api/health` 查看 Web、Worker 与模型服务的连通状态，通过 `DELETE /api/projects/{id}` 清理闲置项目数据；各阶段耗时和错误摘要会记录在项目的 `analysis/run.log`。
 
@@ -93,6 +88,6 @@ Web 服务和任务进程使用同一数据目录。媒体工具路径可设置�
 
 ## 使用
 
-1. 上传原片和字幕，设置可选的字幕偏移。正数将对白字幕向后移动。上传中断后，在原项目重新选择同一原片即可续传。
+1. 上传原片，可选上传 UTF-8 SRT 对白字幕。上传中断后，在原项目重新选择同一原片即可续传。
 2. 在项目页查看分析阶段、原片进度和已识别事件数。保留项目 URL 可在刷新后继续查看。任务进程重启后，从下一批帧恢复描述。项目的 `analysis/` 目录保存 `caption.json`、`caption_score.json` 和 `selected_segments.json`。
 3. 播放成片，选择段落编辑英文旁白、候选镜头与入点和出点。保存修改会更新该段配音及后续时间码。点击「生成当前预览和导出」渲染新版本，MP4 和 SRT 可独立下载。
