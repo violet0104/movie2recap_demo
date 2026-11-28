@@ -1,4 +1,5 @@
 import os
+import re
 import textwrap
 import time
 import wave
@@ -15,12 +16,63 @@ from .media import (
 )
 from .store import append_run_log, movie_path, publish_timeline, read_json, version_path, write_json
 
-CAPTION_FRAMES = 300
+CAPTION_FRAMES = 90
 MIN_CAPTION_FRAMES = 15
 NARRATION_BATCH = 12
 GAP = round(0.16 * SAMPLE_RATE)
 SHORTEN_FACTORS = (0.85, 0.72, 0.58)
 MAX_TTS_SPEED = 1.25
+
+
+def _caption_batch_frames():
+    return max(MIN_CAPTION_FRAMES, int(os.environ.get("RECAP_CAPTION_FRAMES", str(CAPTION_FRAMES))))
+
+
+def _norm_caption(text):
+    cleaned = " ".join(text.lower().split())
+    return re.sub(r"^(the scene (shifts|transitions|cuts|moves) to|next,|then,)\s+", "", cleaned)
+
+
+def _caption_tokens(text):
+    return set(re.findall(r"[a-z0-9']+", _norm_caption(text)))
+
+
+def _jaccard(a, b):
+    if not a and not b:
+        return 1.0
+    return len(a & b) / len(a | b)
+
+
+def _is_collapsed_batch(events):
+    texts = [event.caption.strip() for event in events if event.caption.strip()]
+    if len(texts) < 4:
+        return False
+    norms = [_norm_caption(text) for text in texts]
+    if len(set(norms)) / len(norms) <= 0.5:
+        return True
+    toks = [_caption_tokens(text) for text in texts]
+    adj_high = sum(1 for i in range(len(toks) - 1) if _jaccard(toks[i], toks[i + 1]) >= 0.7)
+    if adj_high / (len(toks) - 1) >= 0.4:
+        return True
+    alt2_high = sum(1 for i in range(len(toks) - 2) if _jaccard(toks[i], toks[i + 2]) >= 0.7)
+    return alt2_high / (len(toks) - 2) >= 0.4
+
+
+def _append_or_merge_segment(segments, start, end, caption):
+    if segments:
+        prev = segments[-1]
+        if start - prev["end"] <= 2.0 and max(prev["end"], end) - prev["start"] <= 45.0:
+            prev_norm, cur_norm = _norm_caption(prev["caption"]), _norm_caption(caption)
+            prev_toks, cur_toks = _caption_tokens(prev["caption"]), _caption_tokens(caption)
+            same = prev_norm == cur_norm or (
+                min(len(prev_toks), len(cur_toks)) >= 5 and _jaccard(prev_toks, cur_toks) >= 0.75
+            )
+            if same:
+                prev["end"] = max(prev["end"], end)
+                return
+    segments.append({
+        "segment_id": len(segments), "start": start, "end": end, "caption": caption,
+    })
 
 
 def progress(project, job, stage, done=None, total=None, **details):
@@ -50,9 +102,10 @@ def caption_movie(project, job, movie, dialogue):
     segments = state["segments"]
     first = state["processed_frames"]
     frames_dir = path.parent / "frames"
+    batch_frames = _caption_batch_frames()
     with AnalysisFrames(movie, frames_dir, duration) as frames:
         while first < frames.total:
-            stop = frames.through(first + CAPTION_FRAMES)
+            stop = frames.through(first + batch_frames)
             if first >= stop:
                 break
             pending = [(first, stop)]
@@ -73,15 +126,21 @@ def caption_movie(project, job, movie, dialogue):
                     pending.append((mid, win_stop))
                     pending.append((win_start, mid))
                     continue
+                if _is_collapsed_batch(batch) and win_stop - win_start >= MIN_CAPTION_FRAMES * 2:
+                    mid = (win_start + win_stop) // 2
+                    append_run_log(
+                        project,
+                        f"events batch [{win_start}, {win_stop}) collapsed into repetition ({len(batch)} segs), bisecting at {mid}",
+                    )
+                    pending.append((mid, win_stop))
+                    pending.append((win_start, mid))
+                    continue
                 cursor = win_start
                 for event in sorted(batch, key=lambda item: item.start):
                     start, stop_time = max(cursor, event.start), min(win_end, event.end)
                     if stop_time - start < 1 / FPS or not event.caption.strip():
                         continue
-                    segments.append({
-                        "segment_id": len(segments), "start": start, "end": stop_time,
-                        "caption": event.caption.strip(),
-                    })
+                    _append_or_merge_segment(segments, start, stop_time, event.caption.strip())
                     cursor = stop_time
                 first = state["processed_frames"] = win_stop
                 write_json(path, state)
