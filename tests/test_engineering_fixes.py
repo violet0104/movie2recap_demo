@@ -108,6 +108,49 @@ def test_score_caption_batches_and_bisects_on_length(monkeypatch):
     assert scored[44]["score"] == 0.88
 
 
+def test_score_caption_strict_context_cap_for_2500_segments_and_400_fallback(monkeypatch):
+    # 2,500 segments (longer than Avatar Extended) must strictly stay within context_chars
+    many_captions = [
+        {"segment_id": i, "start": float(i * 4), "end": float(i * 4 + 4),
+         "caption": f"Distinct event {i}: a character moves across the forest and reacts to a sudden threat."}
+        for i in range(2500)
+    ]
+    ctx = score_caption._format_context(many_captions, max_chars=24_000)
+    assert len(ctx) <= 24_000
+
+    # Consecutive duplicate segments collapse cleanly in overview context
+    dup_captions = [
+        {"segment_id": i, "start": float(i * 2), "end": float(i * 2 + 2),
+         "caption": ("The scene shifts to a room." if i % 2 == 0 else "The scene transitions to a room.")}
+        for i in range(200)
+    ]
+    dup_ctx = score_caption._format_context(dup_captions, max_chars=24_000)
+    assert "x200" in dup_ctx
+    assert len(dup_ctx) < 200
+
+    # Simulate vLLM HTTP 400 maximum context length -> score() halves context and succeeds
+    seen_prompt_lens = []
+
+    def fake_post(url, *, json, timeout, trust_env):
+        user_msg = json["messages"][1]["content"]
+        seen_prompt_lens.append(len(user_msg))
+        if len(user_msg) > 5000:
+            return _make_response(400, '{"error":{"message":"This model\'s maximum context length is 65536 tokens. (parameter=input_tokens)"}}')
+        keys = json["response_format"]["json_schema"]["schema"]["required"]
+        return _make_response(200, {"choices": [{
+            "finish_reason": "stop",
+            "message": {"content": json_lib.dumps({k: 50 for k in keys})},
+        }]})
+
+    json_lib = json
+    monkeypatch.setattr(score_caption.httpx, "post", fake_post)
+    sample = many_captions[:60]
+    scored = score_caption.score(sample, batch_size=30, context_chars=8000, max_retries=2, backoff=0.0)
+    assert len(scored) == 60
+    assert seen_prompt_lens[0] > 5000
+    assert seen_prompt_lens[1] < seen_prompt_lens[0]
+
+
 def test_score_caption_does_not_retry_400(monkeypatch):
     count = 0
 
@@ -198,6 +241,90 @@ def test_caption_movie_bisects_on_length_and_cleans_frames(tmp_path, monkeypatch
     assert saved["processed_frames"] == 60
     assert len(saved["segments"]) == 2
     assert list(frames_dir.glob("*.jpg")) == []
+
+
+def test_caption_batch_sends_penalties_and_max_items_and_recovers_collapsed_loop(tmp_path, monkeypatch):
+    # 1. Verify caption_batch enforces bounded maxItems + anti-repetition penalties
+    frame_file = tmp_path / "000000.jpg"
+    frame_file.write_bytes(b"jpg")
+    seen_payloads = []
+
+    def fake_post(url, *, json, timeout, trust_env):
+        seen_payloads.append(json)
+        return _make_response(200, {"choices": [{
+            "finish_reason": "stop",
+            "message": {"content": '{"segments": [{"start": 0.0, "end": 10.0, "caption": "Hero walks in."}]}'},
+        }]})
+
+    monkeypatch.setattr(model.httpx, "post", fake_post)
+    monkeypatch.setenv("RECAP_REPETITION_PENALTY", "1.15")
+    monkeypatch.setenv("RECAP_FREQUENCY_PENALTY", "0.25")
+    segs = model.caption_batch([(0, frame_file)], 90.0, 0.0, 90.0, [])
+    assert len(segs) == 1
+    payload = seen_payloads[0]
+    assert payload["repetition_penalty"] == 1.15
+    assert payload["frequency_penalty"] == 0.25
+    assert payload["response_format"]["json_schema"]["schema"]["properties"]["segments"]["maxItems"] == 15
+
+    # 2. Verify caption_movie detects lag-2 A-B-A-B loop collapse, bisects, and merges adjacent duplicates
+    project = tmp_path / "proj_loop"
+    (project / "analysis").mkdir(parents=True)
+    frames_dir = project / "analysis" / "frames"
+    frames_dir.mkdir(parents=True)
+    for i in range(60):
+        (frames_dir / f"{i:06}.jpg").write_bytes(b"jpg")
+
+    class FakeFrames:
+        def __init__(self, movie, directory, duration):
+            self.directory = directory
+            self.total = 60
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def through(self, stop):
+            return min(stop, self.total)
+
+        def path(self, index):
+            return self.directory / f"{index:06}.jpg"
+
+    seen_windows = []
+
+    def fake_caption_batch(frames, duration, start, end, dialogue):
+        seen_windows.append((start, end))
+        if end - start > 30:
+            # Return period-2 A-B-A-B collapsed loop
+            return [
+                model.Caption(start=float(i * 10), end=float((i + 1) * 10),
+                              caption=("The figure on the right raises their hand." if i % 2 == 0
+                                       else "The figure on the left looks down."))
+                for i in range(6)
+            ]
+        # Clean bisected sub-batches with an adjacent near-duplicate across boundary (20-30s and 30-40s)
+        if start == 0:
+            return [
+                model.Caption(start=0.0, end=20.0, caption="A soldier enters the misty forest."),
+                model.Caption(start=20.0, end=30.0, caption="A blue-skinned warrior climbs a tree."),
+            ]
+        return [
+            model.Caption(start=30.0, end=40.0, caption="The scene shifts to a blue-skinned warrior climbs a tree."),
+            model.Caption(start=40.0, end=60.0, caption="A helicopter flies overhead."),
+        ]
+
+    monkeypatch.setattr(pipeline, "AnalysisFrames", FakeFrames)
+    monkeypatch.setattr(pipeline.model, "caption_batch", fake_caption_batch)
+
+    job = {"duration": 60.0}
+    caption_path = pipeline.caption_movie(project, job, tmp_path / "movie.mp4", [])
+    saved = store.read_json(caption_path)
+    assert seen_windows == [(0, 60), (0, 30), (30, 60)]
+    # Adjacent near-duplicate (20-30s + 30-40s) merged into 20-40s -> 3 clean segments total
+    assert len(saved["segments"]) == 3
+    assert saved["segments"][1]["start"] == 20.0
+    assert saved["segments"][1]["end"] == 40.0
 
 
 def test_voice_segment_trims_gap_and_fit_narration_recovers_stale_cache(tmp_path, monkeypatch):

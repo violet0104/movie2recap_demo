@@ -77,7 +77,11 @@ ssh -N -o ExitOnForwardFailure=yes -J <用户>@<登录节点>:<SSH端口> \
 | `RECAP_MODEL_URL` | `http://127.0.0.1:8001/v1`（用于画面描述、片段评分与旁白撰写） |
 | `RECAP_MODEL` | `Qwen/Qwen3-VL-8B-Instruct` |
 | `RECAP_MODEL_MAX_RETRIES` | `3`，本地模型服务请求失败重试次数 |
+| `RECAP_CAPTION_FRAMES` | `90`，每次画面描述的帧窗口大小（1 fps 下默认 90 秒） |
+| `RECAP_ANALYSIS_WIDTH` / `RECAP_ANALYSIS_HEIGHT` | `384` / `216`，分析抽帧分辨率 |
+| `RECAP_REPETITION_PENALTY` / `RECAP_FREQUENCY_PENALTY` | `1.1` / `0.2`，画面描述防复读采样惩罚 |
 | `RECAP_SCORE_BATCH_SIZE` | `40`，每次向本地模型请求评分的片段数（保留全片上下文） |
+| `RECAP_SCORE_CONTEXT_CHARS` | `24000`，评分请求附带的全片上下文最大字符数（超限时自动折半降级） |
 | `RECAP_CLEANUP_FRAMES` | `0`，设为 `1` 时在全片描述完成后自动清理 `analysis/frames/` |
 | `RECAP_SKIP_PREFLIGHT` | `0`，设为 `1` 时跳过任务进程启动自检 |
 

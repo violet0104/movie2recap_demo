@@ -71,7 +71,11 @@ def _strip_code_fence(text: str) -> str:
     return cleaned.strip()
 
 
-def _request_completion(schema_name, json_schema, prompt, data, *, frames=None, duration=None, max_tokens=4096, max_retries=None, backoff=1.0):
+def _request_completion(
+    schema_name, json_schema, prompt, data, *,
+    frames=None, duration=None, max_tokens=4096, max_retries=None, backoff=1.0,
+    repetition_penalty=None, frequency_penalty=None,
+):
     content = [{"type": "text", "text": f"{prompt}\n\n{json.dumps(data, ensure_ascii=False)}"}]
     payload = {
         "model": MODEL,
@@ -83,6 +87,10 @@ def _request_completion(schema_name, json_schema, prompt, data, *, frames=None, 
             "json_schema": {"name": schema_name, "schema": json_schema},
         },
     }
+    if repetition_penalty is not None and repetition_penalty != 1.0:
+        payload["repetition_penalty"] = repetition_penalty
+    if frequency_penalty is not None and frequency_penalty != 0.0:
+        payload["frequency_penalty"] = frequency_penalty
     if frames:
         jpegs = ",".join(base64.b64encode(path.read_bytes()).decode("ascii") for _, path in frames)
         content.insert(0, {"type": "video_url", "video_url": {"url": f"data:video/jpeg;base64,{jpegs}"}})
@@ -125,19 +133,32 @@ def ask(schema, prompt, data, *, frames=None, duration=None, max_tokens=4096, ma
 
 
 def caption_batch(frames, duration, start, end, dialogue):
-    return ask(CaptionBatch, (
-        "Describe all events visible in this batch of video frames in the order they appear. "
-        "Group consecutive shots of the same action into one event. Include brief and minor events "
-        "so a later step can judge their importance. If an event crosses a batch boundary, describe "
-        "the part visible here. Use two short English sentences for a brief event and up to three "
-        "for a longer event. Describe the actions and visible consequences. Use descriptive labels "
-        "such as 'a soldier' for people; identifying characters by name is unnecessary. "
-        "Use the matching dialogue only as context when provided. Give each event absolute start and end seconds "
-        "within the batch, with non-overlapping intervals and exclusive end times."
-    ), {
-        "window_start": start, "window_end": end, "frame_count": len(frames),
-        "sample_seconds": [index for index, _ in frames], "dialogue": dialogue,
-    }, frames=frames, duration=duration, max_tokens=8192).segments
+    window_len = max(1.0, end - start)
+    max_items = max(6, min(30, ceil(window_len / 6.0)))
+    schema = CaptionBatch.model_json_schema()
+    schema["properties"]["segments"]["maxItems"] = max_items
+    rep_penalty = float(os.environ.get("RECAP_REPETITION_PENALTY", "1.1"))
+    freq_penalty = float(os.environ.get("RECAP_FREQUENCY_PENALTY", "0.2"))
+    raw = _request_completion(
+        "CaptionBatch",
+        schema,
+        (
+            "Describe the distinct narrative events visible in this batch of video frames in chronological order. "
+            "Merge consecutive shots of the same ongoing action, conversation, or setting into ONE single event "
+            "instead of splitting at fixed intervals or repeating similar descriptions. "
+            f"Return at most {max_items} non-overlapping events with exclusive end times within [window_start, window_end]. "
+            "Use one to two concise English sentences for brief events and at most three for longer events. "
+            "Describe ONLY what is visually observable; never invent sounds, voices, or music. "
+            "Use dialogue only as context to clarify actions or character names when clear; do not paraphrase every subtitle line."
+        ),
+        {
+            "window_start": start, "window_end": end, "frame_count": len(frames),
+            "max_events": max_items, "sample_seconds": [index for index, _ in frames], "dialogue": dialogue,
+        },
+        frames=frames, duration=duration, max_tokens=8192,
+        repetition_penalty=rep_penalty, frequency_penalty=freq_penalty,
+    )
+    return CaptionBatch.model_validate_json(raw).segments
 
 
 def _narration_batch_schema(keys):

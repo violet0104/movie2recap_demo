@@ -13,7 +13,10 @@ from PIL import Image
 
 FFMPEG = os.environ.get("RECAP_FFMPEG", "ffmpeg")
 FFPROBE = os.environ.get("RECAP_FFPROBE", "ffprobe")
-ANALYSIS_SIZE = (224, 128)
+ANALYSIS_SIZE = (
+    max(64, int(os.environ.get("RECAP_ANALYSIS_WIDTH", "384")) // 2 * 2),
+    max(64, int(os.environ.get("RECAP_ANALYSIS_HEIGHT", "216")) // 2 * 2),
+)
 FPS = 30
 SAMPLE_RATE = 24_000
 SAMPLES_PER_FRAME = SAMPLE_RATE // FPS
