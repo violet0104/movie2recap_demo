@@ -7,7 +7,7 @@ const stages: Record<string, string> = {
   queued: "等待任务进程",
   probe: "读取原片与字幕",
   events: "生成分段描述",
-  scoring: "DeepSeek 评分",
+  scoring: "片段重要性评分",
   selection: "按 8% 预算选段",
   script: "撰写英文解说",
   audio: "合成旁白与对齐画面",

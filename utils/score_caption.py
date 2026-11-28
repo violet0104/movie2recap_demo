@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Score caption segments with DeepSeek."""
+"""Score caption segments with the local Qwen model server."""
 
 import os
 import re
@@ -52,9 +52,20 @@ Return JSON only, without explanations, Markdown, or any additional text:
 The number of scores must exactly match the number of input caption_events.
 """
 
-DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-flash"
+DEFAULT_BASE_URL = "http://127.0.0.1:8001/v1"
+DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+SCORES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scores": {
+            "type": "array",
+            "items": {"type": "number"},
+        },
+    },
+    "required": ["scores"],
+    "additionalProperties": False,
+}
 
 
 # extract captions
@@ -103,36 +114,29 @@ def _parse_scores(content, expected_count):
     return [round(max(0.0, min(1.0, float(item))), 2) for item in scores]
 
 
-def _thinking_enabled():
-    return os.environ.get("DEEPSEEK_THINKING", "1").strip().lower() not in {"0", "false", "no", "off"}
-
-
-# use Deepseek scoring captions
+# Score captions with the same Qwen model service used for video understanding
 def score(captions, *, max_retries=None, backoff=1.0):
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise RuntimeError("请为任务进程设置 DEEPSEEK_API_KEY")
-    base_url = os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-    model = os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    base_url = os.environ.get("RECAP_MODEL_URL", DEFAULT_BASE_URL).rstrip("/")
+    model = os.environ.get("RECAP_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     attempts = (
-        max(1, int(os.environ.get("DEEPSEEK_MAX_RETRIES", "3")))
+        max(1, int(os.environ.get("RECAP_MODEL_MAX_RETRIES", "3")))
         if max_retries is None
         else max(1, max_retries)
     )
+    max_tokens = max(2048, min(16384, len(captions) * 12))
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(captions, ensure_ascii=False)},
         ],
-        "stream": False,
-        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "CaptionScores", "schema": SCORES_SCHEMA},
+        },
     }
-    if _thinking_enabled():
-        payload["thinking"] = {"type": "enabled"}
-        effort = os.environ.get("DEEPSEEK_REASONING_EFFORT", "high").strip()
-        if effort:
-            payload["reasoning_effort"] = effort
 
     last_error = None
     scores = None
@@ -140,30 +144,33 @@ def score(captions, *, max_retries=None, backoff=1.0):
         try:
             response = httpx.post(
                 f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
                 json=payload,
                 timeout=900,
+                trust_env=False,
             )
         except httpx.HTTPError as error:
-            last_error = RuntimeError(f"DeepSeek 请求失败: {error}")
+            last_error = RuntimeError(f"模型评分服务连接失败: {error}")
             if attempt + 1 < attempts:
                 time.sleep(backoff * (2 ** attempt))
                 continue
             raise last_error from error
 
         if response.is_error:
-            last_error = RuntimeError(f"DeepSeek HTTP {response.status_code}: {response.text[:1000]}")
+            last_error = RuntimeError(f"模型评分服务 HTTP {response.status_code}: {response.text[:1000]}")
             if response.status_code in RETRYABLE_STATUS and attempt + 1 < attempts:
                 time.sleep(backoff * (2 ** attempt))
                 continue
             raise last_error
 
         try:
-            content = response.json()["choices"][0]["message"]["content"]
+            choice = response.json()["choices"][0]
+            if choice.get("finish_reason") == "length":
+                raise ValueError(f"评分输出超过长度限制（{max_tokens} tokens）")
+            content = choice["message"]["content"]
             scores = _parse_scores(content, len(captions))
             break
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
-            last_error = RuntimeError(f"DeepSeek 返回评分解析失败: {error}")
+            last_error = RuntimeError(f"模型返回评分解析失败: {error}")
             if attempt + 1 < attempts:
                 time.sleep(backoff * (2 ** attempt))
                 continue

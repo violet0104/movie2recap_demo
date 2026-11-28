@@ -11,7 +11,7 @@
 | 网页 | React、TypeScript、Vite | 上传、查看进度、在线播放、逐段编辑和下载。 |
 | Web 服务 | Python、FastAPI | 提供打包后的网页和 API，管理项目文件和任务状态，提供视频播放接口。 |
 | 任务进程 | Python、FFmpeg、ffprobe、Kokoro | 按固定规则抽帧和组窗，调用模型服务并保存结果，生成旁白和成片。 |
-| 模型服务 | Qwen3-VL-8B-Instruct、vLLM、DeepSeek | Qwen 描述画面并写旁白，DeepSeek 根据全片描述给每个片段评分。 |
+| 模型服务 | Qwen3-VL-8B-Instruct、vLLM | Qwen 描述画面、根据全片描述给每个片段评分并写旁白。 |
 | 存储 | 服务器磁盘、JSON | 保存上传素材、分析结果、时间线、配音和导出文件。 |
 | 运行环境 | Linux、NVIDIA GPU、uv | 用普通用户权限安装 Python 环境，在服务器上启动 Web 服务、任务进程和模型服务。 |
 
@@ -20,8 +20,7 @@
 ```text
 服务器浏览器 ↔ FastAPI ↔ 项目目录
 任务进程 ↔ 项目目录
-任务进程 → vLLM / Qwen3-VL
-任务进程 → DeepSeek API（片段描述和时间码）
+任务进程 → vLLM / Qwen3-VL（画面描述、全片评分与旁白撰写）
 任务进程 → Kokoro / FFmpeg
 ```
 
@@ -41,7 +40,7 @@ FFmpeg 按每秒一帧生成分析帧。Qwen3-VL 每次读取 300 帧和同一�
 
 ## 4. 评分和选段
 
-任务进程调用 `utils/score_caption.py` 读入全部片段描述，让 DeepSeek 参考全片内容为每段评分，并保存 `analysis/caption_score.json`。评分请求发送文本和时间码。任务进程通过 `DEEPSEEK_API_KEY` 认证。[DeepSeek Chat Completions 文档](https://api-docs.deepseek.com/api/create-chat-completion/)
+任务进程调用 `utils/score_caption.py` 读入全部片段描述，复用本地 `Qwen3-VL` 模型服务（`RECAP_MODEL_URL` / `RECAP_MODEL`）参考全片内容为每段评分，并保存 `analysis/caption_score.json`。评分请求发送文本和时间码，并使用 JSON Schema 约束输出格式。
 
 `utils/select_segments_knapsack.py` 以原片时长的 8% 为预算，在预算内最大化所选片段的总分，并按起点排序，保存为 `analysis/selected_segments.json`。Qwen 结合选中片段的描述和对白撰写连续的英文旁白，每个片段对应一段旁白。网页保留原片入点和出点，供审看和编辑。
 

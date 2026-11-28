@@ -16,8 +16,6 @@ def preflight():
     errors.extend(media["errors"])
     for warning in media["warnings"]:
         logging.warning("preflight: %s", warning)
-    if not os.environ.get("DEEPSEEK_API_KEY"):
-        errors.append("未设置 DEEPSEEK_API_KEY 环境变量")
     vllm = model.check_model_server(timeout=5.0)
     if not vllm["ok"]:
         errors.append(f"模型服务不可达 ({vllm['url']}): {vllm['error']}")

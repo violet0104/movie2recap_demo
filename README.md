@@ -47,7 +47,7 @@ PATH="$PWD/.vllm/bin:$PATH" .vllm/bin/vllm serve models/Qwen3-VL-8B-Instruct \
 .venv/bin/python -m uvicorn recap.api:app --host 127.0.0.1 --port 8080
 ```
 
-在任务进程的环境中设置 `DEEPSEEK_API_KEY`。模型服务就绪后启动任务进程：
+模型服务就绪后启动任务进程：
 
 ```bash
 HF_HUB_OFFLINE=1 .venv/bin/python -m recap.worker
@@ -74,16 +74,11 @@ ssh -N -o ExitOnForwardFailure=yes -J <用户>@<登录节点>:<SSH端口> \
 | --- | --- |
 | `RECAP_DATA_DIR` | 项目根目录下的 `data` |
 | `RECAP_FFMPEG` / `RECAP_FFPROBE` | `ffmpeg` / `ffprobe` |
-| `RECAP_MODEL_URL` | `http://127.0.0.1:8001/v1` |
+| `RECAP_MODEL_URL` | `http://127.0.0.1:8001/v1`（用于画面描述、片段评分与旁白撰写） |
 | `RECAP_MODEL` | `Qwen/Qwen3-VL-8B-Instruct` |
 | `RECAP_MODEL_MAX_RETRIES` | `3`，本地模型服务请求失败重试次数 |
 | `RECAP_CLEANUP_FRAMES` | `0`，设为 `1` 时在全片描述完成后自动清理 `analysis/frames/` |
 | `RECAP_SKIP_PREFLIGHT` | `0`，设为 `1` 时跳过任务进程启动自检 |
-| `DEEPSEEK_API_KEY` | 由部署环境提供，用于发送分段描述和时间码进行评分 |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` |
-| `DEEPSEEK_MODEL` | `deepseek-flash` |
-| `DEEPSEEK_THINKING` / `DEEPSEEK_REASONING_EFFORT` | `1` / `high`，设为 `0` 可关闭 thinking 参数 |
-| `DEEPSEEK_MAX_RETRIES` | `3`，评分请求重试次数 |
 
 可通过 `GET /api/health` 查看 Web、Worker 与模型服务的连通状态，通过 `DELETE /api/projects/{id}` 清理闲置项目数据；各阶段耗时和错误摘要会记录在项目的 `analysis/run.log`。
 

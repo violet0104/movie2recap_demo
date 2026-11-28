@@ -1,4 +1,3 @@
-import os
 import shutil
 import threading
 from pathlib import Path
@@ -279,13 +278,11 @@ def delete_project(project_id: UUID):
 def health():
     vllm = model.check_model_server(timeout=2.0)
     worker_running = worker_alive()
-    deepseek_configured = bool(os.environ.get("DEEPSEEK_API_KEY"))
-    ok = worker_running and vllm["ok"] and deepseek_configured
+    ok = worker_running and vllm["ok"]
     return {
         "status": "ok" if ok else "degraded",
         "worker_running": worker_running,
         "vllm": vllm,
-        "deepseek_key_configured": deepseek_configured,
     }
 
 
